@@ -17,6 +17,7 @@ import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JColorChooser;
+import javax.swing.JComboBox;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
@@ -135,7 +136,10 @@ public final class Sidebar {
         toggle.setBackground(Theme.SURFACE);
         toggle.setFocusPainted(false);
         toggle.setAlignmentX(Component.LEFT_ALIGNMENT);
-        toggle.addActionListener(e -> plugin.setEnabled(toggle.isSelected()));
+        // Run the toggle on the frame thread, not here on the EDT: startUp() can construct and load
+        // heavy things (the pathfinder decompresses a collision map and parses dozens of tables), and
+        // the frame thread is already touching the same state every frame.
+        toggle.addActionListener(e -> plugin.later(() -> plugin.setEnabled(toggle.isSelected())));
         card.add(toggle);
 
         // A hotkey the plugin claimed, so the panel and the keyboard agree about what F5 does.
@@ -196,7 +200,10 @@ public final class Sidebar {
                 }
                 case INT -> {
                     JLabel label = label(s.label() + ":");
-                    JSlider slider = new JSlider(s.min(), s.max(), s.asInt());
+                    // Clamp defensively: DefaultBoundedRangeModel throws on value < min, which would
+                    // kill the whole panel over one bad setting.
+                    int v = Math.max(s.min(), Math.min(s.max(), s.asInt()));
+                    JSlider slider = new JSlider(s.min(), s.max(), v);
                     slider.setBackground(Theme.SURFACE);
                     slider.setPreferredSize(new Dimension(120, 20));
                     JLabel value = label(String.valueOf(s.asInt()));
@@ -239,6 +246,16 @@ public final class Sidebar {
                     });
                     row.add(label(s.label() + ":"));
                     row.add(swatch);
+                }
+                case ENUM -> {
+                    JComboBox<Object> combo = new JComboBox<>(s.options());
+                    combo.setFont(Theme.UI);
+                    combo.setBackground(Theme.SURFACE_HI);
+                    combo.setForeground(Theme.TEXT);
+                    combo.setSelectedItem(s.value());
+                    combo.addActionListener(e -> s.set(combo.getSelectedItem()));
+                    row.add(label(s.label() + ":"));
+                    row.add(combo);
                 }
             }
 

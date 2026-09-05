@@ -34,8 +34,13 @@ public final class Game {
     public static void refresh() {
         int[] base = Natives.sceneBase();
         loaded = base.length == 2;
-        baseX = loaded ? base[0] : 0;
-        baseY = loaded ? base[1] : 0;
+        int nbx = loaded ? base[0] : 0;
+        int nby = loaded ? base[1] : 0;
+        if (nbx != baseX || nby != baseY) {
+            Entity.clearNameCache();      // scene moved: uids about to churn, names with them
+        }
+        baseX = nbx;
+        baseY = nby;
 
         local = Local.read();
 

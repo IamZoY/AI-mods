@@ -1,43 +1,56 @@
 # KewlKlient
 
-A small, readable OSRS client with a plugin panel, entity visuals, and a worked example bot — in about
-two thousand lines you can hold in your head.
+A small, readable OSRS client with a plugin panel, entity visuals, and a worked example bot.
 
-It exists to be **learned from and hacked on**. There is no auto-updater, no account manager, no plugin
-store. What there is:
+It exists to be **learned from and hacked on**. The core — the API, the plugin model, the config
+system, the drawing — is still the few thousand lines of `java/kewl/` you can hold in your head; the
+bulk of the repo is the vendored Shortest Path plugin and the RuneLite API shim it runs on, which you
+never have to read. There is no auto-updater and no account manager. The plugin hub is a manifest
+endpoint you point it at, not a store of ours. What there is:
 
-- **Everything is Java.** Plugins, settings, the control panel, and all the drawing. No C++ toolchain
-  needed to write a bot or an overlay.
+- **Everything is Java.** Plugins, settings, profiles, and all the drawing. No C++ toolchain needed
+  to write a bot or an overlay.
 - **Overlays are plain Java2D.** Your plugin gets a `Graphics2D` over the game window and draws whatever
   it likes — shapes, alpha, antialiased text, images. Nothing had to expose a "draw box" primitive.
 - **Settings build their own UI.** Declare a setting; the control panel grows the right widget for it.
-  No plugin writes a line of Swing.
+  No plugin writes a line of UI code.
+- **Your state survives a restart.** Enabled states, settings, pins and profiles are persisted under
+  `~/.kewlklient` — plugins declare nothing, do nothing, and get it for free.
 - **No network code at all.** We never build a packet. We call the game's own "do this menu action"
   function and let it build and send the packet. That is the single biggest reason this codebase is
-  small, and the reason it survives most game updates.
-- **Ten native methods.** That is the entire unsafe surface, all in one file.
+  small, and the reason it survives most game updates. (The one exception is the optional plugin
+  hub, which fetches a manifest you point it at — see
+  [docs/plugin-system.md](docs/plugin-system.md).)
+- **Twenty-one native methods.** That is the entire unsafe surface, all in one file.
 
 ```
-       launcher                       injected into the game
+       launcher (ImGui)               injected into the game
     ┌──────────────┐                ┌────────────────────────────────┐
-    │  one button  │ ── inject ──>  │  kewlklient.dll                │
-    └──────────────┘                │    reads memory                │
-                                    │    starts a JVM ───────────────┼──> kewlklient.jar
-                                    │    10 natives ─────────────────┼──>   api + your plugins
-                                    │  <── one finished image/frame ─┼──    overlays (Java2D)
-                                    └────────────────────────────────┘        control panel (Swing)
+    │  "+ client"  │ ── spawn ───>  │  osclient.exe                  │
+    │              │ ── inject ──>  │  └─ kewlklient.dll             │
+    │              │                │     reads memory               │
+    │  286px ImGui │                │     starts a JVM ──────────────┼──> kewlklient.jar
+    │  panel strip │  <== shared == │     21 natives ────────────────┼──>   api + your plugins
+    │  (CPU-raster)│     memory     │  <── one finished image/frame ─┼──    overlays (Java2D)
+    └──────────────┘                └────────────────────────────────┘      plugin state (Java)
 ```
 
 **Java draws, C++ shows.** Java renders the whole overlay into an image and hands it back once a frame;
 C++ puts it on screen and otherwise stays out of the way. That inversion is why a plugin can draw
 anything Java2D can draw, and it costs one memcpy a frame.
 
+**Java owns the state, C++ shows the panel.** The ImGui strip is a view: it renders a snapshot of the
+plugin model that Java publishes into shared memory, and every click comes back as an edit record that
+Java applies through the same paths its own panel uses. There is no second copy of plugin state in
+C++.
+
 ---
 
 ## Quick start
 
 **Windows only.** The whole thing is Win32 — there is no Linux or Mac build and there is not going to be
-one.
+one. (On a Linux desktop you can still run the game itself under Wine and test the whole stack there;
+[`tools/wine.md`](tools/wine.md) is the recipe.)
 
 You need three things installed. The first two you probably have; the third is the one people miss:
 
@@ -53,8 +66,9 @@ You do **not** need Gradle — the wrapper in this repo fetches it.
 
 1. **File → Open** and pick the folder you cloned. It imports as a Gradle project.
 2. Pick the **KewlKlient** run configuration (it is checked into the repo) and press **Run**.
-3. Start OSRS and **log in**.
-4. In the little window that appeared, press **LAUNCH OSRS CLIENT NOW**.
+3. In the ImGui launcher that appeared, press **+ client**. It starts `osclient.exe`, injects the DLL
+   and puts the game inside the launcher's own window.
+4. **Log in.**
 
 That is it — no config file to edit. The build points `kewlklient.ini` at whichever JDK IntelliJ is
 using, and puts everything in `build\dist\`.
@@ -68,7 +82,8 @@ gradlew run
 Same thing. `gradlew dist` builds without launching, and `build.bat` is a wrapper around it for people
 who prefer a double-click.
 
-A **control panel** opens beside the game with a switch and settings for every plugin. The same plugins
+A **panel strip** opens down the right-hand side of the game with a switch, a pin and settings for
+every plugin — plus tabs for profiles, the plugin hub and bridge debug info. The same plugins
 have hotkeys:
 
 | key | does |
@@ -132,12 +147,15 @@ private static final List<Plugin> PLUGINS = new ArrayList<>(List.of(
 ```
 
 Rebuild, restart the client. Your plugin is in the panel with a range slider and a colour picker you
-never wrote. **That list is the entire plugin system** — no scanning, no annotations, no manifest,
-nothing that can silently fail to find your class.
+never wrote, and its state is saved with everyone else's. **That list is the entire plugin system** —
+no scanning, no annotations, no manifest, nothing that can silently fail to find your class.
 
 **Read [`Woodcutter.java`](java/kewl/plugins/Woodcutter.java) next.** It is the worked example and does
 all four things at once: settings, a decision loop that acts on the game, a world overlay, and a
 statistics panel.
+
+Every setting type, the profile model, and how to ship a plugin through the hub instead of the list
+are in [`docs/plugin-system.md`](docs/plugin-system.md).
 
 ### The two methods
 
@@ -215,23 +233,56 @@ right perspective and stay correct while the camera turns.
 ## How it works
 
 ### The launcher
-`launcher/main.cpp` — finds `osclient.exe`, writes the DLL path into it, and calls `LoadLibraryA` on a
-remote thread. The oldest, most boring injection there is, in about thirty lines.
+`launcher/main.cpp` — an ImGui window with a "+ client" button. Pressing it spawns `osclient.exe`
+(the path comes from `[kewl] game=` in `kewlklient.ini`), injects `kewlklient.dll` into it with
+`CreateRemoteThread` + `LoadLibraryW` (the oldest, most boring injection there is), and reparents the
+game's window into the launcher's as a child. From then on one window holds the game on the left and
+a 286px Dear ImGui panel strip on the right, drawn by the launcher process with the CPU
+(`client/imgui_sw.hpp`) — the game owns the only OpenGL context, so the panel never touches a GPU.
+
+The panel's data lives in the game process (Java owns the plugin model, the profiles and the hub), so
+it crosses a shared-memory bridge: Java packs a snapshot (`kewl.panel.PanelBridge`), the DLL repacks
+it into the model region (`client/bridge.hpp`), the launcher reads and renders it
+(`launcher/bridge_layout.hpp`). Clicks travel back as small edit records in a ring in the same region,
+and the DLL applies them by calling Java — through `Setting.set` and the owning managers, never
+around them. The static_asserts in both C++ files make the sides fail a build rather than disagree
+about where byte 40 is, and `tools/bridge-roundtrip-probe.cpp` checks the whole round trip byte for
+byte against the real jar.
+
+Running `osclient.exe` yourself and injecting the DLL by hand skips all of this: the DLL detects
+that it was not launcher-spawned and builds its own host window and Java2D panel exactly as it always
+did (`tools/wine_inject.exe` does the injecting on Linux). Same plugins, same settings, same profiles
+— a different thing drawing the panel.
 
 ### The native half
 - `client/offsets.hpp` — every game-specific number, in one file, each with a note on how to re-find it.
 - `client/game.hpp` — guarded memory reads, entity enumeration, projection, and `doAction`.
 - `client/overlay.hpp` — the transparent window, and the one function that puts pixels in it.
-- `client/jvm.hpp` — starts the JVM and registers the ten natives. The whole unsafe surface.
-- `client/dllmain.cpp` — finds the game window and runs the 30 fps loop.
+- `client/jvm.hpp` — starts the JVM and registers the natives. The whole unsafe surface.
+- `client/bridge.hpp` — the DLL's half of the shared-memory panel bridge (model out, edits in).
+- `client/dllmain.cpp` — finds the game window, detects launcher mode, runs the 30 fps loop.
+- `client/imgui_sw.hpp` — the software rasterizer the launcher draws ImGui with (no GPU: the game owns
+  OpenGL).
+- `launcher/main.cpp` + `launcher/panel_ui.hpp` — the launcher window, the "+ client" spawn/inject/
+  embed, and the ImGui strip itself (plugins, config, profiles, hub, debug, collapse, search).
 
 ### The Java half
-- `java/kewl/Natives.java` — the ten natives, declared. You will not call these directly.
+- `java/kewl/Natives.java` — the natives, declared. You will not call these directly.
 - `java/kewl/api/` — the world with names on it: `Game`, `Entity`, `Local`, `Npcs`, `Players`, `Skills`,
   `Actions`.
-- `java/kewl/ui/` — `Theme` (all the colours), `Hud` (drawing helpers), `Sidebar` (the control panel).
+- `java/kewl/Plugin.java` — the base class, and `java/kewl/plugins/` — the plugins.
 - `java/kewl/config/` — settings that build their own controls.
-- `java/kewl/plugins/` — the plugins.
+- `java/kewl/plugin/` — `PluginManager` (the one place a plugin is switched on or off) and
+  `plugin/hub/` — the external plugin hub (manifest, download, verify, classload, remove).
+- `java/kewl/profile/` — profiles and persistence: per-profile enabled states and settings, debounced
+  atomic writes under `~/.kewlklient`.
+- `java/kewl/panel/PanelBridge.java` — the packed panel model Java publishes and the edits it accepts.
+- `java/kewl/ui/` — `Theme` (all the colours), `Hud` (drawing helpers), and the Java2D panel views the
+  direct-inject path draws (`SidePanel`, `PluginListView`, `ConfigView`, `ProfilesView`, `DebugView`).
+
+More on all of this: [`docs/architecture-after.md`](docs/architecture-after.md) is the architecture
+map, [`docs/plugin-system.md`](docs/plugin-system.md) covers plugins, config, profiles and the hub,
+and [`docs/testing.md`](docs/testing.md) is what is tested and how to verify the rest by hand.
 
 The overlay is a **transparent always-on-top window**, not a renderer hook. Hooking would need a detour
 library, a graphics API to get right, and it crashes inside someone else's render loop when you get it
@@ -254,6 +305,24 @@ builds and sends the packet itself. Consequences:
 - We never need to know the wire format.
 - Anti-cheat sees a normally-constructed packet, because it *is* one.
 - One function to re-find after an update instead of a hundred opcodes.
+
+### RuneLite plugins
+
+There is a second way to write a plugin: port one. `java/net/runelite/` is a **shim, not RuneLite** —
+our own implementation of the `net.runelite.*` API that RuneLite plugins are written against. A plugin
+ported to `java/shortestpath/` (Shortest Path, from the plugin hub) reads the game through that shim and
+runs as an ordinary kewl plugin on the overlay thread; see `java/net/runelite/README.md` and
+`resources/NOTICE-shortest-path` for what is vendored, what is shimming, and what waits on a new offset.
+
+The honest state of it: everything derivable from what kewl already reads works (pathfinding, tile
+overlays, config, events); the parts of the API that need memory offsets kewl does not have yet —
+varps, item containers, widgets, the world map, the menu — return honest defaults through
+`net.runelite.api.ClientState`, and each method there names the offset it is waiting for. Porting more
+hub plugins mostly means deriving those offsets once; the shim is shared.
+
+Auto-walk is the one place kewl extends a ported plugin rather than just hosting it: upstream Shortest
+Path never moves for you, the `Auto-walk` toggle in its panel does, using the same `doAction` walk as
+every other plugin here.
 
 ---
 
@@ -314,8 +383,10 @@ Genuinely useful, roughly easiest first:
    Everything currently shows an id where it wants to show a name.
 3. **Inventory reading.** Nearly every bot needs "am I full yet".
 4. **Ground items.** Pairs with the above to make a looter possible.
-5. **Saving settings.** Config lives in memory and dies with the client. A small properties file next to
-   the jar, written on change, would do it — no new offsets, pure Java, a good first PR.
+5. ~~**Saving settings.**~~ Done — settings, enabled states, pins and profiles persist under
+   `~/.kewlklient` (see `kewl/profile/ProfileManager.java`). Kept on the list so nobody redoes it:
+   the open problem there now is *syncing* a profile between machines, which is a file format
+   question, not an offsets one.
 6. **A minimap overlay.** All the pieces exist; it just needs the minimap's own projection.
 
 Please keep the three rules this codebase is built on: **no packet building**, **every offset gets a
@@ -350,6 +421,17 @@ The game updated and the offsets moved. See [When the game updates](#when-the-ga
 
 **Boxes flicker.**
 Expected — it is a layered window, not a renderer hook. See "The native half".
+
+**The panel strip says "bridge: opening…" forever, or shows nothing.**
+The DLL could not create the shared-memory mapping, or the jar beside the DLL predates the bridge.
+The game's stdout prints `[bridge]` lines saying which; the debug tab in the strip shows the same
+state. A jar without `kewl.panel.PanelBridge` gets an empty panel rather than a hung one.
+
+**My settings did not come back after a restart.**
+They live in `~/.kewlklient/profiles/` — a profile is a complete statement, so only what differs from
+a plugin's declared defaults is written, and a plugin that was never switched on under the active
+profile starts off. A corrupt file is quarantined as `.bad` and fallen back from; look for
+`[profile]` lines in the game's stdout.
 
 ---
 

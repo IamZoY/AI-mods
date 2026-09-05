@@ -2,6 +2,8 @@ package kewl.api;
 
 import java.awt.Point;
 
+import kewl.Natives;
+
 /**
  * One NPC or player in the loaded scene, as it was at the start of this frame.
  *
@@ -24,8 +26,36 @@ public final class Entity {
         this.orientation = orientation;
     }
 
+    /**
+     * Names for the entities seen this frame, uid -> name. A uid names one entity for as long as it
+     * is on screen (the game reuses handles only after a despawn), so a cache keyed by uid is exactly
+     * right and keeps the name() call out of the hot snapshot path: the native walks the whole entity
+     * registry to resolve a uid, which is far too slow to do per entity per frame.
+     */
+    private static final java.util.Map<Integer, String> NAMES = new java.util.HashMap<>();
+
+    /**
+     * Drop every cached name. Called when the scene base moves (a despawn storm walks with it), so a
+     * uid the game reused for a different entity can never serve a stale name.
+     */
+    static void clearNameCache() { NAMES.clear(); }
+
     /** The game's own handle for this entity. Stable while it is on screen; reused after it despawns. */
     public int uid() { return uid; }
+
+    /**
+     * Its name, or "" when the client could not read one (mid-spawn, despawned this frame). Read
+     * through the cache above, then the entityName native.
+     */
+    public String name() {
+        String n = NAMES.get(uid);
+        if (n != null) return n;
+        n = Natives.entityName(uid);
+        if (n == null || n.isEmpty()) return "";
+        if (NAMES.size() > 1024) NAMES.clear();     // despawn storm safety valve
+        NAMES.put(uid, n);
+        return n;
+    }
 
     /** True for another player, false for an NPC. */
     public boolean isPlayer() { return player; }

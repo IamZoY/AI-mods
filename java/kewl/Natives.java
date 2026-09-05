@@ -31,6 +31,22 @@ public final class Natives {
     /** {@code {worldX, worldY}} of the loaded scene's south-west corner. Empty when nothing is loaded. */
     public static native int[] sceneBase();
 
+    /**
+     * One varp (client config variable) by id. 0 before the game's varp array exists -- callers treat
+     * 0 as "unknown", never as a real value.
+     */
+    public static native int varp(int id);
+
+    /**
+     * An item container snapshot (inventory, bank, worn equipment...), flattened
+     * {@code {slot0Id, slot0Qty, slot1Id, slot1Qty, ...}} -- slot {@code i} is {@code [2i]} / {@code [2i+1]}.
+     *
+     * <p>Empty when the container does not exist right now (bank closed, pre-login). A missing item is
+     * id {@code -1}, quantity 0. The snapshot is a moment in time: the game can resize or reorder a
+     * container while you hold it.</p>
+     */
+    public static native int[] container(int containerId);
+
     /** You: {@code {uid, sceneX, sceneY, plane, animation, orientation, runEnergy, cycle}}, or empty. */
     public static native int[] local();
 
@@ -55,8 +71,64 @@ public final class Natives {
     public static native int[] viewport();
 
     /**
+     * Mouse and modifier keys, read from Windows rather than game memory (no offset needed):
+     * {@code {mouseX, mouseY, shift, ctrl, alt, leftButton}}.
+     *
+     * <p>Mouse coordinates are in the game window's client area -- the same space the projection
+     * natives produce screen points in. A held key is 1, a released key 0.</p>
+     */
+    public static native int[] input();
+
+    /**
      * Put a finished frame on the overlay. {@code px} must be {@code w*h} <b>premultiplied</b> ARGB
      * pixels, top row first -- which is exactly what a {@code BufferedImage.TYPE_INT_ARGB_PRE} holds.
      */
     public static native void present(int[] px, int w, int h);
+
+    /**
+     * The control panel's frame, same pixel contract as {@link #present}. Lands on the panel's own
+     * window, pinned to the game's right edge -- {@code w} is the panel's width and {@code h} the
+     * game client's height, which SidePanel chooses.
+     */
+    public static native void presentPanel(int[] px, int w, int h);
+
+    /**
+     * The client's own game-state field: 10 title, 20 logging in, 25 loading, 30 logged in.
+     * 0 before the client object exists.
+     */
+    public static native int gameState();
+
+    /**
+     * An entity's name by uid -- players off entity+0x718, NPCs off their definition's +0x8.
+     * Empty when it despawned or the name could not be read. Names may contain U+00A0 where the
+     * game pads; callers that compare against typed text should fold that to a space.
+     */
+    public static native String entityName(int uid);
+
+    /**
+     * One widget's state by its client id ({@code (group << 16) | component}):
+     * {@code {ok, x, y, width, height, hidden}}, or empty when the group is not loaded right now.
+     * x/y are as the widget stores them -- relative to its parent for nested widgets.
+     */
+    public static native int[] widget(int id);
+
+    /** A widget's primary text line, colour tags included. Empty when not loaded. */
+    public static native String widgetText(int id);
+
+    /**
+     * A widget's dynamic child by index: {@code {ok, x, y, width, height, hidden}}, or empty when the
+     * index is out of range. x/y are relative to the parent widget.
+     */
+    public static native int[] widgetChild(int id, int childIndex);
+
+    /**
+     * The world map's state: {@code {level, originX, originZ, centreX, centreZ}}, or empty before the
+     * map object exists. The origin is the map's coordinate base in world tiles. There is no zoom
+     * here on purpose: the client has no zoom field in this object (verified in the binary), so any
+     * number we returned would be invented.
+     */
+    public static native int[] worldMap();
+
+    /** Ids of every widget group whose component data is currently loaded, ascending. */
+    public static native int[] loadedGroups();
 }

@@ -55,6 +55,12 @@ public final class Config {
         return add(new Setting(key, label, description, Setting.Kind.COLOR, def, 0, 0));
     }
 
+    /** A drop-down of an enum's constants, in declaration order. */
+    public Setting enumeration(String key, String label, String description, Enum<?> def) {
+        Object[] options = def.getClass().getEnumConstants();
+        return add(new Setting(key, label, description, Setting.Kind.ENUM, def, 0, 0, options));
+    }
+
     /** Everything declared, in declaration order. The control panel walks this. */
     public Collection<Setting> all() { return settings.values(); }
 

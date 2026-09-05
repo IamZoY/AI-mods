@@ -11,7 +11,7 @@ import kewl.Natives;
  */
 public final class Local {
 
-    static final Local ABSENT = new Local(false, -1, 0, 0, 0, -1, 0, 0, 0);
+    public static final Local ABSENT = new Local(false, -1, 0, 0, 0, -1, 0, 0, 0);
 
     private final boolean exists;
     private final int uid, sceneX, sceneY, plane, animation, orientation, runEnergy, cycle;
