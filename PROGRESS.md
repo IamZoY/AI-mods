@@ -138,8 +138,11 @@ Final verification pass, run 2026-09-05 against this exact tree:
 
 ## ShortestPath
 - [ ] Its 84 proxied settings surface in the native config panel through the same bridge (offline
-      dump shows the sections); overlays and the ported pathfinder itself are unchanged and
-      live-verified 2026-09-05 -- nothing new to check off here until the human's live pass.
+      dump shows the sections). Verification so far, split honestly: the ImGui strip and the bridge
+      were driven LIVE under Wine up to the login screen (no login was ever attempted); Shortest
+      Path's overlays and the ported pathfinder itself are verified OFFLINE only -- the unit suites
+      and the offline probes -- and have not been seen working in-game. Nothing new to check off
+      here until the human's live pass.
 
 ## Swing removal
 - [ ] Not started, deliberately: `kewl/ui/Sidebar.java` stays as dead code for now -- the direct-inject
@@ -322,6 +325,46 @@ list is claimed as complete anywhere else.
   is the user's action.
 - External plugin isolation is namespace isolation (child-first classloader), not security; stated
   in HubLoader's javadoc and docs/plugin-system.md rather than pretended away.
+
+### RuneLite shim -- remaining offsets
+
+What the shim still holds an honest default for. Each method names its own gap in the code
+(`java/net/runelite/api/ClientState.java` unless noted); this list is the same story in one place.
+
+- **The game menu struct.** `DO_ACTION` is 0 (not derived this build), so the game's own menu entries
+  and click records are unread. `kewl.rl.MenuPopup` is the deliberate fallback design, not a stopgap
+  left in by accident: it detects the right-click from the input snapshot, fires the same
+  MenuOpened/MenuEntryAdded events RuneLite would, and draws the plugin-contributed entries itself.
+  Its limits are stated in its header comment -- it never sees the game's own entries ("Examine" and
+  friends) and cannot stop the game handling the right-click too.
+- **Consequence for auto-walk: nothing can act, and now it says so.** With `DO_ACTION` 0, the DLL's
+  `doAction` is a guarded no-op (`client/game.hpp` refuses to call a null RVA and prints a once-only
+  "doAction dropped" line), and `kewl.api.Actions.walkTo` returns that false to the caller.
+  `kewl.rl.AutoWalk` reports "cannot act: actions unavailable on this client build" in the panel
+  instead of believing it walked. The movement still does not happen -- auto-walk cannot honestly be
+  switched on in-game until `DO_ACTION` is derived -- but the failure is no longer silent.
+- **Minimap zoom and camera yaw.** `getMinimapZoom()` returns 4.0 and `getCameraYawTarget()` returns
+  0; both wait on offsets near the camera/viewport code (anchor: worldToScreenCoord's camera reads),
+  so the minimap stays north-up-approximate.
+- **World map: centre derived and live, zoom not.** The origin MapCoord is derived and VERIFIED LIVE
+  (`client/offsets.hpp` WORLD_MAP / WM_ORIGIN_*), and the centre's coordinate space is pinned in the
+  decompile: one scroll unit is 8 world tiles, so `centreTile = 8*WM_CENTRE = WM_ORIGIN + 48`
+  (FUN_1401ce8b0/FUN_1401cefe0 write `origin = 8*centre - 48`; cross-checked live at the GE, scroll
+  398,429 -> origin 3136,3384). `kewl.rl.Events.pushWorldMap` feeds that centre to the shim's
+  `WorldMap` every frame. The +48 (centre vs load-window corner) follows from the symmetric +-6 load
+  window, not from a live "which tile is under the widget centre" measurement -- worth one probe with
+  the map open. Zoom is deliberately absent: the adversarial pass proved there is no zoom field
+  anywhere in the world-map object (no "zoom" string in the binary), so the shim's placeholder 4.0f
+  is what the map overlays' maths run on -- `PathMapOverlay` and `PathMapTooltipOverlay` draw at the
+  correct centre but a guessed scale whenever the map widget is open. World-map markers
+  (`WorldMapPointManager`, rendered by `OverlayRenderer`) additionally gate on the map data being
+  live.
+- **Widget bounds parent-relative assumption (unverified).** The widget native returns the x/y the
+  widget stores, which are parent-relative for nested widgets. `ClientState.getWidget` adds parent
+  offsets only on the nested-descend path (two or more ids); a single packed id -- which is how
+  Shortest Path fetches `InterfaceID.Worldmap.MAP_CONTAINER` -- takes the stored x/y as canvas
+  coordinates with no parent accumulation. That assumption has not been verified for MAP_CONTAINER
+  specifically.
 
 ### Verification gaps in the test suite
 

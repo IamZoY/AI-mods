@@ -40,6 +40,9 @@ public class WorldView
 		return Game.sceneBaseY();
 	}
 
+	/** 0..3, or -1 when the client could not read a plane (ENTITY_PLANE is SUSPECT this build --
+	 *  see client/offsets.hpp; the native range-guards the read to -1). Callers must not treat -1
+	 *  as a floor: overlay plane comparisons will simply never match it. */
 	public int getPlane()
 	{
 		return Game.me().plane();
@@ -86,6 +89,12 @@ public class WorldView
 	 * height, and keeps the one nearest the cursor -- within a tile-sized radius, so a cursor over
 	 * UI or the sky yields null rather than the closest tile anyway.
 	 *
+	 * <p>One bypass: while kewl's own right-click popup menu is open the cursor is over one of its
+	 * rows, not over the scene, so the nearest-tile scan below would name the row's neighbour (rows
+	 * sit 22 px apart) or nothing at all. For the frames {@code ClientState.isMenuOpen()} is true
+	 * this returns the tile MenuPopup captured at the moment the right-click landed -- parked in the
+	 * ClientState -- and the scan does not run.</p>
+	 *
 	 * <p>Honest degradations, both shared with the overlays: no heightmap (Perspective.getTileHeight
 	 * is 0) so on slopes and upper floors the picked tile is the one whose ground projection is
 	 * nearest, and the plane is the local player's, not the cursor's. Cached per frame because the
@@ -93,6 +102,12 @@ public class WorldView
 	 */
 	public Tile getSelectedSceneTile()
 	{
+		ClientState state = Client.get().state();
+		if (state.isMenuOpen())
+		{
+			return state.getMenuOpenedTile();
+		}
+
 		int frame = kewl.KewlKlient.frame();
 		if (cachedTileFrame == frame)
 		{

@@ -153,6 +153,10 @@ public class RlitePlugin extends Plugin
 		{
 			autoWalk.reset();
 		}
+		// tick() only runs the popup while enabled, so a menu up when the user switches the plugin
+		// off would never see another tick: force-close it, or isMenuOpen() stays true (and the
+		// captured tile stays parked) until the plugin is enabled and ticked again.
+		menuPopup.close();
 		autoWalkStatus = null;
 		// remove(), not getOverlays().removeAll(): getOverlays() hands back an unmodifiable view, and
 		// removeAll on it throws -- the overlays would only ever leave by the plugin's own shutDown

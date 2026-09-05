@@ -36,8 +36,13 @@ resources/LICENSE-shortest-path. It is reproduced here as required:
   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
   POSSIBILITY OF SUCH DAMAGE.
 
-(The upstream file carries placeholder year/holder text; the work belongs to
-the shortest-path authors listed in the repos above.)
+(A note on the copyright line above: it is not a placeholder we forgot to fill in. The upstream
+repository's own LICENSE file -- added there by Runemoro in October 2020 -- carries
+"Copyright (c) <YEAR>, <COPYRIGHT HOLDER>" verbatim, and no upstream file names a copyright holder,
+so there is no real line to copy and we will not invent one. The file alongside this notice is a
+byte-for-byte copy of upstream's. The work belongs to the shortest-path authors named in the repos
+above -- Skretzo (original) and Zoinkwiz and the fork's contributors -- and BSD-2's requirement is
+met by keeping their licence text with the sources and this attribution.)
 
 Also vendored, from RuneLite (https://github.com/runelite/runelite, BSD
 2-Clause): the net.runelite.api.gameval constant tables and small utility

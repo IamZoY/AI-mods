@@ -23,8 +23,10 @@ public final class Natives {
      * Every visible entity, seven ints each, flattened:
      * {@code uid, sceneX, sceneY, isPlayer, id, animation, orientation}.
      *
-     * <p>{@code id} is the NPC type for NPCs and the combat level for players -- they are different
-     * things stored in different places, and packing them into one slot keeps this array rectangular.</p>
+     * <p>{@code id} is the NPC type for NPCs. For players it is always {@code -1} on this build: the
+     * combat-level offset we had is wrong on client-240-6 (it read pointer garbage, not a level) and
+     * has been gated off pending re-derivation -- see {@code PLAYER_COMBAT_LEVEL} in
+     * {@code client/offsets.hpp}. Treat -1 as "combat level unavailable", never as a level.</p>
      */
     public static native int[] entities();
 
@@ -61,21 +63,41 @@ public final class Natives {
      */
     public static native long project(int fineX, int fineHeight, int fineY);
 
-    /** Perform a menu action, in SCENE coordinates. This is the only way KewlKlient acts on the game. */
-    public static native void doAction(int sceneX, int sceneY, int opcode, int targetId);
+    /**
+     * Perform a menu action, in SCENE coordinates. This is the only way KewlKlient acts on the game.
+     *
+     * @return true when the action was handed to the client; false when it was NOT issued -- either
+     *     the client object is not up yet, or the client's action function could not be derived for
+     *     this build ({@code DO_ACTION == 0} in {@code client/offsets.hpp}), in which case this call
+     *     is a silent no-op on the game side and this boolean is the only signal that nothing
+     *     happened. Callers must not report success on a false.
+     */
+    public static native boolean doAction(int sceneX, int sceneY, int opcode, int targetId);
 
-    /** Interact with an NPC by uid; the native side looks its tile up. */
-    public static native void interactNpc(int uid, int opcode);
+    /**
+     * Interact with an NPC by uid; the native side looks its tile up.
+     *
+     * @return false when the uid did not resolve (the NPC despawned this frame) or the action was not
+     *     issued -- see {@link #doAction} for what that means.
+     */
+    public static native boolean interactNpc(int uid, int opcode);
 
     /** The game's client area on screen: {@code {x, y, width, height}}. */
     public static native int[] viewport();
 
     /**
-     * Mouse and modifier keys, read from Windows rather than game memory (no offset needed):
-     * {@code {mouseX, mouseY, shift, ctrl, alt, leftButton}}.
+     * Mouse, modifier keys and keyboard edges, read from Windows rather than game memory (no offset
+     * needed). The array is EIGHT fixed ints followed by up to SIXTEEN key-edge entries:
+     * {@code {mouseX, mouseY, shift, ctrl, alt, leftButton, rightButton, middleButton, vk1, vk2, ...}}.
      *
      * <p>Mouse coordinates are in the game window's client area -- the same space the projection
-     * natives produce screen points in. A held key is 1, a released key 0.</p>
+     * natives produce screen points in. A held modifier or button is 1, a released one 0. The trailing
+     * entries are KEY EDGES: the virtual-key codes that went from up to down since the previous call,
+     * so plugin hotkeys can dispatch real KeyEvents. There are never more than 16 of them per call and
+     * the total length therefore varies -- index the first eight blindly, everything else by length.</p>
+     *
+     * <p>{@code net.runelite.api.ClientState.setInputState} is the intended parser: it unpacks the
+     * fixed fields and turns the key edges into this frame's events.</p>
      */
     public static native int[] input();
 
@@ -123,9 +145,11 @@ public final class Natives {
 
     /**
      * The world map's state: {@code {level, originX, originZ, centreX, centreZ}}, or empty before the
-     * map object exists. The origin is the map's coordinate base in world tiles. There is no zoom
-     * here on purpose: the client has no zoom field in this object (verified in the binary), so any
-     * number we returned would be invented.
+     * map object exists. The origin is the map's coordinate base in world tiles; the centre ints are
+     * the map centre in 8-tile units (centre tile = {@code 8 * centre = origin + 48}), passed through
+     * raw and unused by the Java side right now. There is no zoom here on purpose: the client has no
+     * zoom field in this object or its view (verified in the binary), so any number we returned would
+     * be invented.
      */
     public static native int[] worldMap();
 

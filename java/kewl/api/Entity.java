@@ -64,8 +64,10 @@ public final class Entity {
     public boolean isNpc() { return !player; }
 
     /**
-     * For an NPC, its type id -- what kind of creature it is, and the thing you filter on. For a player,
-     * this is their combat level instead, because a player has no type.
+     * For an NPC, its type id -- what kind of creature it is, and the thing you filter on. For a
+     * player this is {@code -1}: the combat-level offset the shim had is wrong on this build and has
+     * been gated off pending re-derivation (see {@code PLAYER_COMBAT_LEVEL} in {@code
+     * client/offsets.hpp}), so no player carries a combat level here yet.
      */
     public int id() { return id; }
 

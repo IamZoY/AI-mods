@@ -140,18 +140,37 @@ final class Events
 	}
 
 	/**
-	 * Push the world map's position into the shim's WorldMap each frame. The origin is the map's own
-	 * coordinate base in world tiles (VERIFIED LIVE); the zoom stays at the shim's placeholder because
-	 * the client provably has no zoom field for the map object -- inventing one would put the map
-	 * overlay's maths quietly wrong, which is worse than it staying off.
+	 * Push the world map's centre into the shim's WorldMap each frame, in world tiles.
+	 *
+	 * The native array is {level, originX, originZ, centreX, centreZ}. The centre ints are the map's
+	 * scroll position in units of 8 tiles, and the origin is that same centre shifted -48 tiles (the
+	 * corner of the map-square load window -- derived from FUN_1401ce8b0/FUN_1401cefe0, which write
+	 * origin = 8*centre - 48 and load squares over centre-6..centre+6). So the centre tile is
+	 * 8*centreScroll = origin + 48; both encodings were checked live at the GE (scroll 398,429 ->
+	 * origin 3136,3384 = 8*398-48, 8*429-48), and the origin read is used here because it is the one
+	 * verified across sessions. One caveat, stated where the value is consumed: the +48 (centre vs
+	 * load-window corner) follows from the symmetric +-6 load window, not from a live "which tile is
+	 * under the widget centre" measurement -- worth one probe with the map open before trusting
+	 * on-map click targets to the exact tile.
+	 *
+	 * There is still no zoom: the client provably has no zoom field on the world-map object, so the
+	 * placeholder WorldMap already carries is passed straight back through. See WorldMap's header for
+	 * what that placeholder does and does not buy the overlays.
 	 */
 	private void pushWorldMap()
 	{
 		int[] wm = kewl.Natives.worldMap();
 		if (wm.length == 5)
 		{
-			WorldMap.INSTANCE.set(new net.runelite.api.Point(wm[1], wm[2]),
+			// wm[1]/wm[2] are WM_ORIGIN_X/Z; +48 turns the load-window corner into the centre tile.
+			WorldMap.INSTANCE.set(new net.runelite.api.Point(wm[1] + 48, wm[2] + 48),
 				WorldMap.INSTANCE.getWorldMapZoom());
+		}
+		else
+		{
+			// No world-map object (pre-login or the client dropped it): whatever was pushed before is
+			// stale, so drop liveness rather than let overlays and map clicks act on dead data.
+			WorldMap.INSTANCE.clear();
 		}
 	}
 }

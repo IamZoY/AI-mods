@@ -245,3 +245,21 @@ Known quirks of the test rig, not the client (relevant when re-running the check
 - Synthetic XTEST input races the keyboard dual-path dedup (a key can be delivered by both the
   window-message and the polling path — doubled letters). Real keyboards go through the message
   path and are deduped by `g_kbMsgSeen`.
+
+Landed after this section was written, so none of the checks above cover it: the right-click popup
+and the world-map plumbing. `kewl/rl/MenuPopup.java` now detects a right-click from the `input()`
+snapshot, fires the same `MenuOpened`/`MenuEntryAdded` events RuneLite would, and draws the
+plugin-contributed entries itself — including a synthetic "Walk here" that walks to the tile the
+right-click landed on. It does not show the game's own menu entries and cannot stop the game
+handling the right-click too, because the game menu struct is still unread (`DO_ACTION` is not
+derived this build; `Natives.doAction` is a guarded no-op that returns false, and auto-walk reports
+"cannot act" instead of pretending to walk). On the map side, the `worldMap` native is derived and
+live — `kewl/rl/Events.pushWorldMap` feeds the shim's `WorldMap` the real centre tile every frame
+(`centreTile = 8*WM_CENTRE = WM_ORIGIN + 48`, pinned in the decompile and cross-checked at the GE) —
+but there is deliberately no zoom: the binary provably has no zoom field, so `WorldMap` holds a
+placeholder 4.0f. The map overlays (`PathMapOverlay`, `PathMapTooltipOverlay`) are therefore live
+rather than gated off — they render whenever the world-map widget is open and `drawMap` is on — and
+are anchored at the correct centre, but their on-map geometry runs at that placeholder zoom; world-map
+markers additionally require the map data to be live. None of this has been seen working against a
+logged-in client; it belongs in
+the human's live pass (section 3).

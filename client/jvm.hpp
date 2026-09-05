@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <jni.h>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include "game.hpp"
@@ -94,6 +95,10 @@ inline jboolean JNICALL nReady(JNIEnv*, jclass) {
 /// Every visible entity, flattened, seven ints each:
 ///     uid, sceneX, sceneY, isPlayer, typeId, animation, orientation
 ///
+/// `typeId` is the NPC's type id; for players it is always -1 on this build -- PLAYER_COMBAT_LEVEL
+/// (offsets.hpp) is wrong here and reading it shipped pointer-fragment garbage as combat levels -- so
+/// the slot is -1 for players until that offset is re-derived.
+///
 /// One array rather than one object per entity on purpose -- this is called thirty times a second, and
 /// allocating a few hundred short-lived objects a frame is exactly the kind of thing that turns into a
 /// stutter you then spend an evening profiling. Java unpacks it into records once.
@@ -106,6 +111,8 @@ inline jintArray JNICALL nEntities(JNIEnv* env, jclass) {
         flat.push_back(e.sceneX);
         flat.push_back(e.sceneY);
         flat.push_back(player ? 1 : 0);
+        // -1 for players: combatLevel() is gated off because PLAYER_COMBAT_LEVEL is wrong on this
+        // build (see offsets.hpp and game.hpp).
         flat.push_back(player ? combatLevel(e.addr) : npcTypeId(e.addr));
         flat.push_back(e.animation);
         flat.push_back(e.orientation);
@@ -207,16 +214,20 @@ inline jlong JNICALL nProject(JNIEnv*, jclass, jint fineX, jint fineHeight, jint
     if (sx < -64.f || sy < -64.f || sx > cwW + 64.f || sy > cwH + 64.f)
         return static_cast<jlong>(0x8000000000000000ULL);
 
-    // Once a second, MEASURE the space instead of arguing about it: project your own tile and print
-    // it next to the canvas size, the camera ints the leaf subtracts, and the divide/multiply pair
-    // of its final rescale (offsets.hpp CAMERA_FINE_*, VIEW_*). Standing still, that point must land
-    // on your own character. When it does not, this one line says which space is wrong and by how
-    // much: cam values near sceneBase<<7 mean the camera is world-based and our scene-fine input is
-    // not (fix: project world fine coords); numerator != denominator means the leaf returns a scaled
-    // space, not canvas pixels (fix: the ratio is the correction). This is diagnosis for an offset
-    // that has never been verified in-game -- delete the probe once the boxes sit on the NPCs.
+    // Off unless KEWL_LOG is set -- the same gate the launcher's input diagnostics print behind
+    // (dllmain.cpp redirects stdout to the file it names). Unconditional here meant one line per
+    // second in every session, which is noise nobody asked for. Once enabled, it MEASUREs the space
+    // instead of arguing about it: project your own tile and print it next to the canvas size, the
+    // camera ints the leaf subtracts, and the divide/multiply pair of its final rescale (offsets.hpp
+    // CAMERA_FINE_*, VIEW_*). Standing still, that point must land on your own character. When it
+    // does not, this one line says which space is wrong and by how much: cam values near
+    // sceneBase<<7 mean the camera is world-based and our scene-fine input is not (fix: project
+    // world fine coords); numerator != denominator means the leaf returns a scaled space, not canvas
+    // pixels (fix: the ratio is the correction). This is diagnosis for an offset that has never been
+    // verified in-game -- delete the probe once the boxes sit on the NPCs.
     static int probe = 0;
-    if ((probe++ % 30) == 0) {
+    static bool probeEnabled = ::getenv("KEWL_LOG") != nullptr;
+    if (probeEnabled && (probe++ % 30) == 0) {
         bool found = false;
         Entity me = localPlayer(found);
         float mx = 0.f, my = 0.f;
@@ -227,7 +238,7 @@ inline jlong JNICALL nProject(JNIEnv*, jclass, jint fineX, jint fineHeight, jint
                 camX = rd<std::int32_t>(c + off::CAMERA_FINE_X);
                 camH = rd<std::int32_t>(c + off::CAMERA_FINE_H);
                 camY = rd<std::int32_t>(c + off::CAMERA_FINE_Y);
-                std::uintptr_t v10 = rdp(c + off::VIEW_OBJ) + 0x10;
+                std::uintptr_t v10 = rdp(c + off::VIEW_OBJ) + off::VIEW_OBJ_SCALE_BASE;
                 bw = rd<std::int32_t>(v10 + off::VIEW_BASE_W);
                 bh = rd<std::int32_t>(v10 + off::VIEW_BASE_H);
                 vw = rd<std::int32_t>(v10 + off::VIEW_CANVAS_W);
@@ -245,13 +256,19 @@ inline jlong JNICALL nProject(JNIEnv*, jclass, jint fineX, jint fineHeight, jint
 }
 
 /// Perform a menu action. SCENE coordinates. See game.hpp for why this is the only way we act.
-inline void JNICALL nDoAction(JNIEnv*, jclass, jint sx, jint sy, jint opcode, jint targetId) {
-    doAction(sx, sy, opcode, targetId);
+///
+/// Returns false when the action was NOT issued: DO_ACTION is 0 for this build (the address was never
+/// derived -- calling a guessed address would crash the game) or the client object is not up yet. The
+/// game-side call is then a silent no-op, so this boolean is the caller's only signal that nothing
+/// happened; plugins must not report success on it.
+inline jboolean JNICALL nDoAction(JNIEnv*, jclass, jint sx, jint sy, jint opcode, jint targetId) {
+    return doAction(sx, sy, opcode, targetId) ? JNI_TRUE : JNI_FALSE;
 }
 
-/// Interact with an NPC by uid, looking its tile up for you.
-inline void JNICALL nInteractNpc(JNIEnv*, jclass, jint uid, jint opcode) {
-    interactNpc(uid, opcode);
+/// Interact with an NPC by uid, looking its tile up for you. Returns false when the uid did not
+/// resolve (it despawned this frame) or the action was dropped -- see nDoAction.
+inline jboolean JNICALL nInteractNpc(JNIEnv*, jclass, jint uid, jint opcode) {
+    return interactNpc(uid, opcode) ? JNI_TRUE : JNI_FALSE;
 }
 
 /// The game's client area on screen: {x, y, width, height}. Java needs the size to make its image and
@@ -418,10 +435,12 @@ inline jintArray JNICALL nWidgetChild(JNIEnv* env, jclass, jint id, jint childIn
 
 /// The world map's state: {level, originX, originZ, centreX, centreZ}, or empty when the map object
 /// does not exist yet. The origin is the map's own coordinate base in world tiles (MapCoord at
-/// wm+0x54B8, VERIFIED LIVE); the centre ints are the scroll position -- derived but their coordinate
-/// space is not pinned down yet, so they are passed through raw rather than interpreted.
-/// There is deliberately no zoom here: the adversarial pass proved there is no zoom field anywhere in
-/// the world-map object (no "zoom" string exists in the binary), so inventing one would be a lie.
+/// wm+0x54B8, VERIFIED LIVE). The centre ints are the map centre in 8-world-tile units
+/// (centreTile = 8 * centre = origin + 48; see the WM_* block in offsets.hpp), but they are passed
+/// through RAW here: the centre is derived while the zoom is NOT, so there is nothing to turn them
+/// into, and nothing on the Java side consumes them right now. There is deliberately no zoom in this
+/// array either: the derivation pass proved there is no zoom field anywhere in the world-map object
+/// or its view, so inventing one would be a lie.
 inline jintArray JNICALL nWorldMap(JNIEnv* env, jclass) {
     std::uintptr_t wm = worldMap();
     if (!wm) return env->NewIntArray(0);
@@ -452,7 +471,8 @@ inline jintArray JNICALL nLoadedGroups(JNIEnv* env, jclass) {
             if (garr && gcount > 0 && gcount <= 0x1000) {
                 ids.reserve(static_cast<std::size_t>(gcount));
                 for (std::uint64_t g = 0; g < gcount; ++g) {
-                    if (rdp(garr + g * 24 + 16)) ids.push_back(static_cast<jint>(g));
+                    if (rdp(garr + g * off::IFACE_GROUP_ENTRY_STRIDE + off::IFACE_GROUP_ENTRY_DATA))
+                        ids.push_back(static_cast<jint>(g));
                 }
             }
         }
@@ -576,8 +596,8 @@ inline bool startJvm(const std::wstring& javaHome, const std::wstring& jarPath, 
         { const_cast<char*>("local"),       const_cast<char*>("()[I"),    reinterpret_cast<void*>(nLocal) },
         { const_cast<char*>("skills"),      const_cast<char*>("()[I"),    reinterpret_cast<void*>(nSkills) },
         { const_cast<char*>("project"),     const_cast<char*>("(III)J"),  reinterpret_cast<void*>(nProject) },
-        { const_cast<char*>("doAction"),    const_cast<char*>("(IIII)V"), reinterpret_cast<void*>(nDoAction) },
-        { const_cast<char*>("interactNpc"), const_cast<char*>("(II)V"),   reinterpret_cast<void*>(nInteractNpc) },
+        { const_cast<char*>("doAction"),    const_cast<char*>("(IIII)Z"), reinterpret_cast<void*>(nDoAction) },
+        { const_cast<char*>("interactNpc"), const_cast<char*>("(II)Z"),   reinterpret_cast<void*>(nInteractNpc) },
         { const_cast<char*>("viewport"),    const_cast<char*>("()[I"),    reinterpret_cast<void*>(nViewport) },
         { const_cast<char*>("input"),       const_cast<char*>("()[I"),    reinterpret_cast<void*>(nInput) },
         { const_cast<char*>("present"),     const_cast<char*>("([III)V"), reinterpret_cast<void*>(nPresent) },

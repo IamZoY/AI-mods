@@ -28,7 +28,8 @@ class AutoWalk
 	/** How far ahead of the cursor, in tiles, we are willing to aim in one walk action. */
 	private static final int MAX_SCENE_REACH = 30;
 
-	/** The client's cycle counter is a frame counter (+1 per 20ms); a game tick is 600ms of them. */
+	/** The client's cycle counter is a frame counter (+1 per frame callback); a game tick is ~600ms
+	 *  of them (~20ms a frame, the OSRS frame pace -- not re-proven on this build), so ~30. */
 	private static final int FRAMES_PER_TICK = 30;
 
 	private final ShortestPathPlugin plugin;
@@ -121,7 +122,13 @@ class AutoWalk
 		}
 
 		int target = path.get(runEnd).getPackedPosition();
-		if (Actions.walkTo(WorldPointUtil.unpackWorldX(target), WorldPointUtil.unpackWorldY(target)))
+		// walkTo returns false both for a tile outside the loaded scene and -- the case that matters
+		// here -- when the client's action path is unavailable (DO_ACTION not derived for this build,
+		// see client/offsets.hpp). The in-scene filter above rules the first case out, so a false is
+		// reported to the panel as cannot-act, never as "walking".
+		lastWalkIssued = Actions.walkTo(WorldPointUtil.unpackWorldX(target),
+			WorldPointUtil.unpackWorldY(target));
+		if (lastWalkIssued)
 		{
 			lastTarget = target;
 			cursor = runEnd;
@@ -144,8 +151,14 @@ class AutoWalk
 	 */
 	private int furthestWalkableIndex(List<PathStep> path, int plane)
 	{
+		// plane < 0 = the client could not read a plane (ENTITY_PLANE is SUSPECT this build, see
+		// client/offsets.hpp; the native range-guards obvious garbage to -1). With no plane to match,
+		// the filter would reject every tile and wedge the walk at "nothing on this plane" forever,
+		// so it is skipped entirely: walk the farthest in-scene tile and let the scene bound be the
+		// only filter.
+		boolean filterPlane = plane >= 0;
 		int start = cursor;
-		while (start < path.size()
+		while (start < path.size() && filterPlane
 			&& WorldPointUtil.unpackWorldPlane(path.get(start).getPackedPosition()) != plane)
 		{
 			start++;
@@ -157,7 +170,7 @@ class AutoWalk
 			int packed = path.get(i).getPackedPosition();
 			int x = WorldPointUtil.unpackWorldX(packed);
 			int y = WorldPointUtil.unpackWorldY(packed);
-			if (WorldPointUtil.unpackWorldPlane(packed) != plane)
+			if (filterPlane && WorldPointUtil.unpackWorldPlane(packed) != plane)
 			{
 				break; // next plane change: stop here, the player crosses it themselves
 			}
@@ -190,6 +203,12 @@ class AutoWalk
 
 	private String status(int remaining)
 	{
+		// The last walk attempt was refused: the client has no usable action path, so saying
+		// "walking" here would report movement that is not happening.
+		if (!lastWalkIssued)
+		{
+			return "cannot act: actions unavailable on this client build";
+		}
 		return remaining > 1 ? "walking, " + remaining + " tiles left" : "at destination";
 	}
 
@@ -201,6 +220,7 @@ class AutoWalk
 		cursor = 0;
 		lastCursorTile = -1;
 		stuckTicks = 0;
+		lastWalkIssued = true;
 	}
 
 	/** Packed position of the tile the last walk action aimed at; UNDEFINED before the first one. */
@@ -212,6 +232,8 @@ class AutoWalk
 	private int lastCursorTile = -1;
 	/** Ticks spent more than 2 tiles from lastTarget without closing in; a refused walk must re-aim. */
 	private int stuckTicks;
+	/** Result of the last walk attempt; false once the client refuses actions, which status() reports. */
+	private boolean lastWalkIssued = true;
 	/** Identity of the pathfinder the cursor belongs to; a new instance resets it. */
 	private Pathfinder lastPathfinder;
 }

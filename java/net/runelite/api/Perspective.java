@@ -101,7 +101,15 @@ public class Perspective
 	@Nullable
 	public static Point localToMinimap(Client client, LocalPoint point, int distance)
 	{
-		LocalPoint focus = client.getLocalPlayer().getLocalLocation();
+		// The local player is null across logout, and this is called from per-frame overlay renders;
+		// returning null is what the @Nullable contract is for (PathTileOverlay's callers already
+		// treat a null as "not this frame").
+		Player localPlayer = client.getLocalPlayer();
+		if (localPlayer == null)
+		{
+			return null;
+		}
+		LocalPoint focus = localPlayer.getLocalLocation();
 
 		final int dx = point.getX() - focus.getX();
 		final int dy = point.getY() - focus.getY();

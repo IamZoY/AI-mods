@@ -43,9 +43,13 @@ below is GPL-incompatible with the project's own licence.
   https://github.com/Skretzo/shortest-path (original).
 - **Licence and notice:** [`resources/NOTICE-shortest-path`](resources/NOTICE-shortest-path) is the
   notice, and it reproduces the licence as required; the upstream licence file itself ships at
-  [`resources/LICENSE-shortest-path`](resources/LICENSE-shortest-path). BSD 2-Clause — redistribution
-  and use in source and binary forms, with or without modification, are permitted provided the
-  copyright notice and that disclaimer accompany them, which is what this file and those two do.
+  [`resources/LICENSE-shortest-path`](resources/LICENSE-shortest-path), a byte-for-byte copy of
+  upstream's. One oddity worth saying out loud: upstream's own LICENSE carries the template text
+  "Copyright (c) \<YEAR\>, \<COPYRIGHT HOLDER\>" — it was added to the upstream repository that way and
+  never filled in, so the copy here shows the same placeholders. Nothing was invented to replace
+  them; the NOTICE names the authors the work belongs to. BSD 2-Clause — redistribution and use in
+  source and binary forms, with or without modification, are permitted provided the copyright notice
+  and that disclaimer accompany them, which is what this file and those two do.
 
 ## RuneLite — vendored verbatim files, BSD 2-Clause
 

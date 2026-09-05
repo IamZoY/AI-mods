@@ -11,8 +11,9 @@
 //
 // What this cannot do, and does not pretend to: show the game's own entries ("Examine", whatever the
 // cursor is over) -- we never see them -- and block the game from also handling the right-click. The
-// game draws its own menu underneath ours; clicking one of ours never touches the game's, because the
-// game only acts on its own menu through click records we do not produce.
+// game draws its own menu underneath ours. Assumed, not verified: we produce no click records, but
+// the game also receives these clicks, and how NXT selects its own menu row from real mouse messages
+// -- including whether it can pick a row that is underneath ours -- is unverified.
 //
 // The one game entry we fake is "Walk here": the popup only opens when a plugin contributed rows, and
 // a menu that says "Walk here / Set target" whose Walk here closes it and does nothing reads as
@@ -61,7 +62,10 @@ public class MenuPopup
 	/**
 	 * The tile under the cursor when the menu opened, which is what "Walk here" means. Re-picking at
 	 * click time would not do: a click on row N lands 20+ px below where the right-click did, and the
-	 * tile picker's 100 px radius is happy to call that the neighbouring tile.
+	 * tile picker's 100 px radius is happy to call that the neighbouring tile. A copy is parked in
+	 * the ClientState when the menu opens (see open()), so WorldView.getSelectedSceneTile() answers
+	 * with this tile for as long as the menu is up -- plugin row clicks resolve their world point
+	 * through that same path.
 	 */
 	private Tile walkTile;
 
@@ -75,11 +79,28 @@ public class MenuPopup
 	{
 		var state = Client.get().state();
 		// isMenuOpen() for this frame: the game's own menu-open flag is unread, and the only menu
-		// with entries in it right now is this one.
-		state.setPopupMenuOpen(open);
-
+		// with entries in it right now is this one. Only an OPEN popup may raise the flag -- the
+		// registry can hold several RlitePlugins, each with its own MenuPopup, and a closed one must
+		// not clear the flag another plugin's open popup raised this frame. close() lowers it, and
+		// only when it was actually open (an onDisable force-close of a not-open popup must not
+		// kick the flag out from under a popup that belongs to a different plugin).
+		if (open)
+		{
+			state.setPopupMenuOpen(true);
+		}
 		boolean rbutton = state.rbuttonDown();
 		boolean lbutton = state.lbuttonDown();
+
+		if (state.isMenuOpen() && !open)
+		{
+			// Another plugin's popup owns the open menu. Stand down for this frame -- opening a
+			// second menu over it (and re-posting MenuOpened with our entries) would duplicate
+			// rows -- but keep the edge trackers current so a fresh right-click after it closes
+			// still opens ours.
+			prevRbutton = rbutton;
+			prevLbutton = lbutton;
+			return;
+		}
 
 		if (open)
 		{
@@ -88,21 +109,26 @@ public class MenuPopup
 
 			if (lbutton && !prevLbutton)
 			{
-				if (hover >= 0 && hover < entries.size())
+				MenuEntry clicked = (hover >= 0 && hover < entries.size()) ? entries.get(hover) : null;
+				if (clicked != null)
 				{
-					MenuEntry entry = entries.get(hover);
-					close();
 					try
 					{
-						if (entry.getOnClick() != null)
+						// Invoke while the menu is still marked open and the captured tile is still
+						// parked: the plugin resolves its world point through
+						// getSelectedSceneTile(), which answers with the tile from open() for
+						// exactly this reason -- at click time the cursor sits on row N, tens of
+						// pixels below where the right-click did.
+						if (clicked.getOnClick() != null)
 						{
-							entry.getOnClick().accept(entry);
+							clicked.getOnClick().accept(clicked);
 						}
 					}
 					catch (Throwable t)
 					{
 						System.out.println("[menu] onClick threw: " + t);
 					}
+					close();
 				}
 				else
 				{
@@ -111,7 +137,7 @@ public class MenuPopup
 			}
 			else if (rbutton && !prevRbutton)
 			{
-				close();                         // a second right-click re-opens elsewhere next frame
+				close();                         // a second right-click closes it; opening again waits for a fresh press after release
 			}
 			else
 			{
@@ -138,7 +164,14 @@ public class MenuPopup
 	{
 		Menu menu = Client.get().getMenu();
 		entries = List.of();
+		// Capture the tile here, while the right-click coordinates are still the true ones -- the
+		// menu-open flag is not up yet, so the picker still scans. By the time a row click
+		// dispatches, the cursor is on the row, and the picker would name a neighbour tile or
+		// nothing. The same tile goes to the ClientState, where WorldView.getSelectedSceneTile()
+		// reads it back from for every frame the menu is open (it also runs the plugin's own world
+		// point resolution off that path).
 		walkTile = Client.get().getTopLevelWorldView().getSelectedSceneTile();
+		state.setMenuOpenedTile(walkTile);
 
 		// A fresh menu, then the same events the game's menu opening would fire. Both posts are
 		// synchronous, so by the time open() returns, plugin-created entries are in pending.
@@ -163,6 +196,11 @@ public class MenuPopup
 		}
 		if (ours.isEmpty())
 		{
+			// Nothing to show: undo the capture above, or a Tile from this scene stays parked in the
+			// ClientState across scene reloads and world hops. close() is the normal un-parker, but
+			// the popup is about to not open at all, so nothing else would clear it.
+			state.setMenuOpenedTile(null);
+			walkTile = null;
 			return;                              // nothing to show; stay closed
 		}
 		// Game-menu order: Walk here above whatever the plugins added.
@@ -176,13 +214,28 @@ public class MenuPopup
 		hover = -1;
 	}
 
-	private void close()
+	/**
+	 * Dismiss the popup and clear everything that outlives a frame of it: the entries, the captured
+	 * tile, and the ClientState flag and tile. Public because it is also called from outside the
+	 * tick loop -- RlitePlugin.onDisable must force-close, or a popup left up when the plugin is
+	 * switched off ticks no more and holds isMenuOpen() (and the stale captured tile) forever.
+	 */
+	public void close()
 	{
+		boolean wasOpen = open;
 		open = false;
 		entries = List.of();
 		hover = -1;
 		walkTile = null;
-		Client.get().state().setPopupMenuOpen(false);
+		// Lower the flag only if this popup is the one that raised it: with several RlitePlugins
+		// alive, a force-close from onDisable of a NOT-open popup must not clear another plugin's
+		// open popup's flag (its own next tick re-raises it, but the frame in between renders with
+		// the tile-parking bypass silently off).
+		if (wasOpen)
+		{
+			Client.get().state().setPopupMenuOpen(false);
+			Client.get().state().setMenuOpenedTile(null);
+		}
 	}
 
 	/**

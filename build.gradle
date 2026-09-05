@@ -209,7 +209,7 @@ tasks.register('run', Exec) {
         if (!exe.exists()) {
             throw new GradleException("KewlKlient.exe was not built. Look for the CMake error above this.")
         }
-        logger.lifecycle("\n  Start OSRS and log in, then press LAUNCH OSRS CLIENT NOW.\n")
+        logger.lifecycle("\n  Press '+ client' in the launcher to start, inject and embed the game, then log in.\n")
     }
 
     commandLine distDir.get().file('KewlKlient.exe').asFile.absolutePath

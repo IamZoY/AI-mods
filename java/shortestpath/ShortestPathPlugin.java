@@ -743,6 +743,9 @@ public class ShortestPathPlugin extends Plugin
 					}
 				}
 			}
+			// Unreachable under the popup fallback: the shim's menu only ever posts the synthetic
+			// "Walk here" entry, so a game-supplied "Flash icons" option never arrives to match here.
+			// Kept for when the menu native lands.
 			if (event.getOption().equals(FLASH_ICONS) && pathfinderConfig.hasDestination(simplify(event.getTarget())))
 			{
 				addMenuEntry(event, FIND_CLOSEST, event.getTarget(), 1);
@@ -759,6 +762,8 @@ public class ShortestPathPlugin extends Plugin
 			addMenuEntry(event, CLEAR, PATH, 0);
 		}
 
+		// Unreachable under the popup fallback, same as Flash icons above: "Floating World Map" and
+		// "Close Floating panel" are game menu options the shim's synthetic menu never emits.
 		if (minimap != null && pathfinder != null
 			&& ("Floating World Map".equals(Text.removeTags(event.getOption()))
 			|| "Close Floating panel".equals(Text.removeTags(event.getOption()))))
@@ -1316,11 +1321,14 @@ public class ShortestPathPlugin extends Plugin
 		}
 		else
 		{
-			// The shim's world map centre is (0,0) until the worldMap() native lands (Phase D) -- and
-			// (0,0) is ocean no real map is ever centred on. Without this a map click turns into a
-			// target in the far south-west, and with auto-walk on the client quietly starts walking
-			// there. Until the native exists a map click simply sets nothing.
-			if (client.getWorldMap().getWorldMapPosition().getX() <= 0)
+			// A map click turns into a target through calculateMapPoint, which is anchored on the
+			// shim's WorldMap centre. Until Events reports that centre live, the conversion would land
+			// on whatever stale tile the placeholder pointed at, and with auto-walk on the client
+			// quietly starts walking there. So while the map data is not live a map click simply sets
+			// nothing. (The gate is the liveness flag, not the position's sign: a real centre can sit
+			// at or below x=0 in principle, and the old getX() <= 0 check only worked by coincidence
+			// with the placeholder being (0,0).)
+			if (!client.getWorldMap().isLive())
 			{
 				return WorldPointUtil.UNDEFINED;
 			}

@@ -22,6 +22,13 @@ import shortestpath.transport.Transport;
 
 public class PathMapOverlay extends Overlay
 {
+	/**
+	 * Largest tile extent per axis the collision-map pass will walk. The real world is a few thousand
+	 * tiles across and the widget only shows a few hundred at any sane zoom; past this the extent came
+	 * from broken map maths, and iterating it would hang the frame.
+	 */
+	private static final int MAX_EXTENT_TILES = 1024;
+
 	private final Client client;
 	private final ShortestPathPlugin plugin;
 
@@ -53,7 +60,7 @@ public class PathMapOverlay extends Overlay
 		Area worldMapClipArea = getWorldMapClipArea(worldMapRectangle);
 		graphics.setClip(worldMapClipArea);
 
-		if (plugin.drawCollisionMap)
+		if (plugin.drawCollisionMap && collisionExtentIsSane(worldMapRectangle))
 		{
 			graphics.setColor(plugin.colourCollisionMap);
 			int mapWorldPoint = plugin.calculateMapPoint(worldMapRectangle.x, worldMapRectangle.y);
@@ -200,6 +207,27 @@ public class PathMapOverlay extends Overlay
 		}
 
 		return clipArea;
+	}
+
+	/**
+	 * The collision pass walks every tile between the map points of two opposite widget corners. When
+	 * calculateMapPoint returns UNDEFINED (the pixel is outside what the map maths can invert),
+	 * unpackWorldX(-1) is 32767 and the loops would iterate ~32767^2 tiles, hanging the frame. Bail
+	 * out when either corner is UNDEFINED or the extent is negative (inverted corners) or past
+	 * {@link #MAX_EXTENT_TILES} -- the same shape of guard drawOnMap's Integer.MIN_VALUE checks are.
+	 */
+	private boolean collisionExtentIsSane(Rectangle baseRectangle)
+	{
+		int topLeft = plugin.calculateMapPoint(baseRectangle.x, baseRectangle.y);
+		int bottomRight = plugin.calculateMapPoint(
+			baseRectangle.x + baseRectangle.width, baseRectangle.y + baseRectangle.height);
+		if (topLeft == WorldPointUtil.UNDEFINED || bottomRight == WorldPointUtil.UNDEFINED)
+		{
+			return false;
+		}
+		int width = WorldPointUtil.unpackWorldX(bottomRight) - WorldPointUtil.unpackWorldX(topLeft);
+		int height = WorldPointUtil.unpackWorldY(topLeft) - WorldPointUtil.unpackWorldY(bottomRight);
+		return width >= 0 && width <= MAX_EXTENT_TILES && height >= 0 && height <= MAX_EXTENT_TILES;
 	}
 
 	private int getWorldMapExtentWidth(Rectangle baseRectangle)

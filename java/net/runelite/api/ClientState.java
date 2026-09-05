@@ -154,6 +154,13 @@ public class ClientState
 	 * we drew ourselves -- which is the only menu entries get created for right now anyway.
 	 */
 	private volatile boolean popupMenuOpen;
+	/**
+	 * The scene tile the right-click landed on, parked here by kewl's menu popup when it opens. While
+	 * the popup is up the cursor is over a menu row rather than over the scene, so WorldView's
+	 * nearest-tile-to-cursor scan would answer with the row's neighbour; getSelectedSceneTile()
+	 * returns this tile instead for every frame isMenuOpen() is true. Not game state.
+	 */
+	private volatile Tile menuOpenedTile;
 	/** Virtual-key codes that turned pressed this frame; replaced wholesale by setInputState. */
 	private volatile int[] keyEdges = new int[0];
 	private int lastInputFrame = -1;
@@ -164,10 +171,14 @@ public class ClientState
 	}
 
 	/**
-	 * Per-frame snapshot from the input() native: {mouseX, mouseY, shift, ctrl, alt, lbutton,
-	 * rbutton, mbutton, then one entry per virtual-key code that turned pressed since the previous
-	 * frame}. The bridge dispatches the edges as KeyEvents, so a Keybind hotkey works the way it does
-	 * in RuneLite, and kewl's menu popup watches rbutton for the right-click that opens it.
+	 * Per-frame snapshot from the input() native: {mouseX, mouseY, shift, ctrl, alt, leftButton,
+	 * rightButton, middleButton, then the virtual-key codes that went from up to down since the
+	 * previous frame}. The eight leading slots are fixed and their buttons are held-down flags; the
+	 * trailing entries are key EDGES, up to 16 of them (the native's buffer is 8 + 16 slots, and an
+	 * edge past the 16th in one frame is dropped -- its held/released state still updates, so a key
+	 * kept down does not re-fire next frame). The bridge dispatches the edges as KeyEvents, so a
+	 * Keybind hotkey works the way it does in RuneLite, and kewl's menu popup watches rightButton
+	 * for the right-click that opens it.
 	 *
 	 * <p>The frame check makes this idempotent per frame: the native computes edges against the
 	 * previous frame, so a second call in the same frame (two bridged plugins tick in sequence) must
@@ -415,6 +426,23 @@ public class ClientState
 	public void setPopupMenuOpen(boolean open)
 	{
 		popupMenuOpen = open;
+	}
+
+	/**
+	 * The tile the right-click landed on, for the frames kewl's popup menu is open; null otherwise.
+	 * WorldView.getSelectedSceneTile() hands this back instead of scanning while isMenuOpen() is
+	 * true, so a plugin resolving a world point from a row click gets the tile under the
+	 * right-click, not the tile under whichever row the cursor has since moved onto.
+	 */
+	public Tile getMenuOpenedTile()
+	{
+		return menuOpenedTile;
+	}
+
+	/** Called by kewl's menu popup when it opens; cleared together with the flag when it closes. */
+	public void setMenuOpenedTile(Tile tile)
+	{
+		menuOpenedTile = tile;
 	}
 
 	public ItemDefinition getItemDefinition(int itemId)

@@ -93,6 +93,9 @@ have hotkeys:
 | F5 | the woodcutter on/off |
 | F3, F4, F6–F8 | free, for your plugins |
 
+That table covers the built-ins only. The two shim-hosted plugins in the registry below declare no
+hotkey; a ported RuneLite plugin's keys come from its own keybind settings, not this table.
+
 If nothing appears, see [Troubleshooting](#troubleshooting).
 
 ---
@@ -142,17 +145,25 @@ private static final List<Plugin> PLUGINS = new ArrayList<>(List.of(
         new kewl.plugins.PlayerVisuals(),
         new kewl.plugins.NpcVisuals(),
         new kewl.plugins.Woodcutter(),
-        new kewl.plugins.CowSpotter()          // <- yours
+        new kewl.plugins.CowSpotter(),         // <- yours
+        new kewl.rl.RlitePlugin("Shortest Path", "Pathfinder over the world map, with auto-walk",
+                shortestpath.ShortestPathPlugin::new),
+        new kewl.rl.RlitePlugin("Test Rlite", "Shim smoke test: config, events, overlay",
+                kewl.rl.TestRlite::new)
 ));
 ```
+
+The last two are not hand-written plugins but the shim pattern: an adapter (`kewl.rl.RlitePlugin`)
+hosting a plugin ported off RuneLite's API. They are ordinary registry entries — panel, settings,
+profiles and all — and the reason the real list has five lines, not three.
 
 Rebuild, restart the client. Your plugin is in the panel with a range slider and a colour picker you
 never wrote, and its state is saved with everyone else's. **That list is the entire plugin system** —
 no scanning, no annotations, no manifest, nothing that can silently fail to find your class.
 
 **Read [`Woodcutter.java`](java/kewl/plugins/Woodcutter.java) next.** It is the worked example and does
-all four things at once: settings, a decision loop that acts on the game, a world overlay, and a
-statistics panel.
+all four things at once: settings, a decision loop that drives the game's action API, a world overlay,
+and a statistics panel.
 
 Every setting type, the profile model, and how to ship a plugin through the hub instead of the list
 are in [`docs/plugin-system.md`](docs/plugin-system.md).
@@ -306,19 +317,42 @@ builds and sends the packet itself. Consequences:
 - Anti-cheat sees a normally-constructed packet, because it *is* one.
 - One function to re-find after an update instead of a hundred opcodes.
 
+**The honest state of that right now:** `DO_ACTION` is 0 — not derived for the current build — and
+`client/game.hpp` refuses to call a null RVA, so every action call is a guarded no-op by design
+(calling the wrong address would crash the game; reading a wrong offset only shows a wrong number).
+Plugins can be written and overlays run, but nothing can walk, chop or talk until someone re-derives
+the function by hook-and-log — `client/offsets.hpp` documents the method and the current candidate.
+Everything above describes the design and what it buys you once that one number is back.
+
 ### RuneLite plugins
 
 There is a second way to write a plugin: port one. `java/net/runelite/` is a **shim, not RuneLite** —
 our own implementation of the `net.runelite.*` API that RuneLite plugins are written against. A plugin
 ported to `java/shortestpath/` (Shortest Path, from the plugin hub) reads the game through that shim and
-runs as an ordinary kewl plugin on the overlay thread; see `java/net/runelite/README.md` and
-`resources/NOTICE-shortest-path` for what is vendored, what is shimming, and what waits on a new offset.
+runs as an ordinary kewl plugin on the overlay thread; see `java/net/runelite/README.md` for what is
+vendored, what is shimming, and what waits on a new offset. (`resources/NOTICE-shortest-path` and
+`resources/LICENSE-shortest-path` are the licence side of the same story, not a technical one.)
 
-The honest state of it: everything derivable from what kewl already reads works (pathfinding, tile
-overlays, config, events); the parts of the API that need memory offsets kewl does not have yet —
-varps, item containers, widgets, the world map, the menu — return honest defaults through
-`net.runelite.api.ClientState`, and each method there names the offset it is waiting for. Porting more
-hub plugins mostly means deriving those offsets once; the shim is shared.
+The honest state of it: the offsets are mostly landed. Wired to registered natives are varps and
+varbits, item containers, widgets (bounds, text and children), NPC/player names, and the world map's
+origin position; everything derivable from those is built and unit-tested — pathfinding, tile
+overlays, config, events, the right-click popup. None of it has been seen working in-game yet (no
+login has ever been attempted), and until `DO_ACTION` below is derived nothing here can actually act.
+What still returns an honest default through `net.runelite.api.ClientState`, each method naming the
+offset it is waiting for:
+
+- **The game menu struct.** `DO_ACTION` is not derived yet, so nothing can read the game's own
+  right-click menu. `kewl/rl/MenuPopup.java` is the deliberate fallback: kewl detects the right-click,
+  fires the same events RuneLite would, and draws the plugin-contributed entries itself.
+- **World-map zoom.** The map's centre is derived and live (`kewl/rl/Events.java`'s `pushWorldMap`:
+  `centreTile = 8*WM_CENTRE = WM_ORIGIN + 48`, pinned in the decompile and cross-checked at the GE),
+  but there is deliberately no zoom, because the binary provably has no zoom field to read. The map
+  overlays' maths run on a placeholder zoom, so on-map drawing is anchored at the correct centre at a
+  guessed scale.
+- **Minimap zoom and camera yaw.** Both are placeholder defaults in `ClientState` until offsets near
+  the camera/viewport code are derived.
+
+Porting more hub plugins mostly means deriving the remaining offsets once; the shim is shared.
 
 Auto-walk is the one place kewl extends a ported plugin rather than just hosting it: upstream Shortest
 Path never moves for you, the `Auto-walk` toggle in its panel does, using the same `doAction` walk as
@@ -379,15 +413,28 @@ Genuinely useful, roughly easiest first:
    enumerate scenery — that means walking the scene's object grid, about six more offsets. Land this and
    every gathering plugin gets shorter, and the woodcutter loses its most awkward setting.
    *(the highest-value one on this list, by a distance)*
-2. **Names.** NPC and player names live behind a pointer chain the client's own `npcName` binding walks.
-   Everything currently shows an id where it wants to show a name.
-3. **Inventory reading.** Nearly every bot needs "am I full yet".
-4. **Ground items.** Pairs with the above to make a looter possible.
-5. ~~**Saving settings.**~~ Done — settings, enabled states, pins and profiles persist under
+2. **The game menu struct.** `DO_ACTION` is still 0, so nothing can read the game's own menu entries or
+   click records — every menu action goes through the drawn-popup fallback in
+   `kewl/rl/MenuPopup.java`, and until this lands nothing can actually act in-game (see
+   [the RuneLite plugins section](#runelite-plugins) for what that means for auto-walk). Hook-and-log
+   is the method; `client/offsets.hpp` explains it.
+3. **Minimap zoom and camera yaw.** Both sit near the camera/viewport code — `worldToScreenCoord`'s
+   camera reads are the anchor. `ClientState.getMinimapZoom()` and `getCameraYawTarget()` hold the
+   placeholders today; landing them is what makes a rotated minimap and a kewl-native minimap
+   overlay possible.
+4. **Ground items.** Item containers are readable now; the scene's ground-item stack walk on top of
+   that is what makes a looter possible.
+5. ~~**Names.**~~ Done — the `entityName` native walks the client's own `npcName` binding, and NPC and
+   player names come through (`kewl/api/Entity.java`, `net/runelite/api/Player.java`).
+6. ~~**Inventory reading.**~~ Done — the `container` native reads any item container in one call
+   (wired through `net.runelite.api.ClientState.getItemContainer`).
+7. ~~**Saving settings.**~~ Done — settings, enabled states, pins and profiles persist under
    `~/.kewlklient` (see `kewl/profile/ProfileManager.java`). Kept on the list so nobody redoes it:
    the open problem there now is *syncing* a profile between machines, which is a file format
    question, not an offsets one.
-6. **A minimap overlay.** All the pieces exist; it just needs the minimap's own projection.
+8. ~~**A minimap overlay.**~~ Done for the ported plugin — Shortest Path ships a minimap overlay.
+   What is still open for kewl's own plugins is item 3: without the minimap zoom offset nothing of
+   ours can draw on it correctly.
 
 Please keep the three rules this codebase is built on: **no packet building**, **every offset gets a
 comment saying how it was found**, and **nothing claims to work until it has been seen working**.

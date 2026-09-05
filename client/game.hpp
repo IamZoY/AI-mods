@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include "offsets.hpp"
 
@@ -82,9 +83,13 @@ inline int npcTypeId(std::uintptr_t entity) {
     return rd<std::int32_t>(def, -1);
 }
 
-/// A player's combat level. Zero if it is not a player or the read fails.
-inline int combatLevel(std::uintptr_t entity) {
-    return entity ? rd<std::int32_t>(entity + off::PLAYER_COMBAT_LEVEL) : 0;
+/// A player's combat level. ALWAYS -1 on this build: the offset we had (PLAYER_COMBAT_LEVEL,
+/// offsets.hpp) is wrong on client-240-6 -- it read a pointer fragment on NPCs and -1 on the local
+/// player -- so reading it here shipped pointer garbage out as players' combat levels. Same
+/// -1-means-unavailable convention as npcTypeId above; re-derive the offset (see its block in
+/// offsets.hpp) before any read comes back.
+inline int combatLevel(std::uintptr_t /*entity*/) {
+    return -1;
 }
 
 /// Walk every entity in the client's registry -- players AND NPCs, from their separate tables -- and
@@ -115,6 +120,12 @@ void forEachEntity(F&& cb) {
                 ent.sceneY = rd<std::int32_t>(e + off::ENTITY_SCENE_Y);
                 if (ent.sceneX < 0 || ent.sceneY < 0 || ent.sceneX > 104 || ent.sceneY > 104) continue;
                 ent.plane       = rd<std::int32_t>(e + off::ENTITY_PLANE);
+                // ENTITY_PLANE is SUSPECT on this build (offsets.hpp: the decompile points at 0x7CC
+                // instead). An in-range read could still be wrong, but an out-of-range one is
+                // certainly not a plane: mark it unknown (-1) rather than ship garbage. Java treats
+                // -1 as "plane unavailable" (AutoWalk walks without the plane filter; overlay plane
+                // comparisons simply never match, so nothing draws at a wrong height).
+                if (ent.plane < 0 || ent.plane > 3) ent.plane = -1;
                 ent.animation   = rd<std::int32_t>(e + off::ENTITY_ANIMATION, -1);
                 ent.orientation = rd<std::int32_t>(e + off::ENTITY_ORIENTATION);
                 cb(ent);
@@ -203,7 +214,9 @@ inline int skillXp(int which) {
     return rd<std::int32_t>(c + off::SKILL_XP + static_cast<std::uintptr_t>(which) * 4);
 }
 
-/// Run energy, 0..10000 (so 10000 is a full bar).
+/// Run energy, 0..10000 (so 10000 is a full bar). SUSPECT: the offset behind this (RUN_ENERGY,
+/// offsets.hpp) could not be re-derived on client-240-6 and nothing here re-checks it, so treat the
+/// number as unverified until that happens.
 inline int runEnergy() {
     std::uintptr_t c = clientObj();
     return c ? rd<std::int32_t>(c + off::RUN_ENERGY) : 0;
@@ -289,8 +302,8 @@ inline std::uintptr_t widgetObj(int id) {
     if (g < 0 || static_cast<std::uint64_t>(g) >= gcount || gcount > 0x1000) return 0;
     std::uintptr_t garr = rdp(mgr + off::IFACE_GROUP_ARRAY);
     if (!garr) return 0;
-    std::uint64_t ccount = rd<std::uint64_t>(garr + static_cast<std::uintptr_t>(g) * 24 + 8);
-    std::uintptr_t cdata = rdp(garr + static_cast<std::uintptr_t>(g) * 24 + 16);
+    std::uint64_t ccount = rd<std::uint64_t>(garr + static_cast<std::uintptr_t>(g) * off::IFACE_GROUP_ENTRY_STRIDE + off::IFACE_GROUP_ENTRY_COUNT);
+    std::uintptr_t cdata = rdp(garr + static_cast<std::uintptr_t>(g) * off::IFACE_GROUP_ENTRY_STRIDE + off::IFACE_GROUP_ENTRY_DATA);
     int comp = id & 0xFFFF;
     if (!cdata || static_cast<std::uint64_t>(comp) >= ccount) return 0;
     std::uintptr_t w = rdp(cdata + static_cast<std::uintptr_t>(comp) * 16 + 8);
@@ -350,7 +363,7 @@ inline std::uintptr_t containerNode(int containerId) {
     std::uintptr_t sentinel = rdp(buckets + static_cast<std::uintptr_t>(mask) * 8);
     for (int guard = 0; node && node != sentinel && guard < 512; ++guard) {
         if (rd<std::int32_t>(node) == containerId) return node;
-        node = rdp(node + 0x38);
+        node = rdp(node + off::CONTAINER_NODE_NEXT);
     }
     return 0;
 }
@@ -359,8 +372,8 @@ inline std::uintptr_t containerNode(int containerId) {
 inline int containerSize(int containerId) {
     std::uintptr_t n = containerNode(containerId);
     if (!n) return -1;
-    auto start = rd<std::uintptr_t>(n + 0x08);
-    auto end   = rd<std::uintptr_t>(n + 0x10);
+    auto start = rd<std::uintptr_t>(n + off::CONTAINER_NODE_IDS);
+    auto end   = rd<std::uintptr_t>(n + off::CONTAINER_NODE_IDS_END);
     if (!start || end < start || end - start > 0x100000) return -1;   // torn update mid-resize
     return static_cast<int>((end - start) >> 2);
 }
@@ -371,14 +384,14 @@ inline int containerItem(int containerId, int slot) {
     std::uintptr_t n = containerNode(containerId);
     int size = containerSize(containerId);
     if (!n || slot < 0 || slot >= size) return -1;
-    return rd<std::int32_t>(rd<std::uintptr_t>(n + 0x08) + static_cast<std::uintptr_t>(slot) * 4, -1);
+    return rd<std::int32_t>(rd<std::uintptr_t>(n + off::CONTAINER_NODE_IDS) + static_cast<std::uintptr_t>(slot) * 4, -1);
 }
 
 inline int containerQty(int containerId, int slot) {
     std::uintptr_t n = containerNode(containerId);
     int size = containerSize(containerId);
     if (!n || slot < 0 || slot >= size) return 0;
-    return rd<std::int32_t>(rd<std::uintptr_t>(n + 0x20) + static_cast<std::uintptr_t>(slot) * 4);
+    return rd<std::int32_t>(rd<std::uintptr_t>(n + off::CONTAINER_NODE_QTYS) + static_cast<std::uintptr_t>(slot) * 4);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -419,29 +432,48 @@ inline bool project(int sceneX, int sceneY, float& outX, float& outY) {
 /// `sceneX`/`sceneY` are SCENE coordinates (0..104), not world ones. `opcode` is a menu action number
 /// from offsets.hpp. `targetId` is whatever that action targets -- for scenery it is the object id.
 ///
+/// Returns true when the action was handed to the client, false when it was DROPPED: either the client
+/// object is not up yet, or DO_ACTION is 0 for this build (the address was never derived, and calling a
+/// guessed address crashes the game). The boolean is the only way a caller can tell an issued action
+/// from a silent no-op -- plugins must not report success on a false.
+///
 /// MUST be called from the game thread. Calling it from our own thread works most of the time and then
 /// crashes at the worst moment, so the overlay queues actions and the plugin tick runs them on a timer
 /// that is slow enough not to matter. If you make KewlKlient do anything fancier than this, hook a
 /// per-frame function and run actions from there.
-inline void doAction(int sceneX, int sceneY, int opcode, int targetId) {
+inline bool doAction(int sceneX, int sceneY, int opcode, int targetId) {
     std::uintptr_t c = clientObj();
-    if (!c || off::DO_ACTION == 0) return;   // DO_ACTION 0 = not derived this build; acting would crash
+    if (!c) return false;
+    if (off::DO_ACTION == 0) {   // DO_ACTION 0 = not derived this build; acting would crash
+        // One line, ever: plugins tick many times a second and this drop is a build problem, not a
+        // per-call event. Goes to stdout, which KEWL_LOG redirects to a file (dllmain.cpp).
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::printf("[kewl] doAction dropped: DO_ACTION not derived for this build\n");
+            std::fflush(stdout);
+        }
+        return false;
+    }
     using Fn = void(__fastcall*)(void*, int, int, int, int, int, long long, int, int, long long);
     auto fn = reinterpret_cast<Fn>(moduleBase() + off::DO_ACTION);
     fn(reinterpret_cast<void*>(c), sceneX, sceneY, opcode, targetId, 0, 0, 0, 0, 0);
+    return true;
 }
 
-/// Walk to a SCENE tile. The game pathfinds and sends the movement itself; we only say where.
-inline void walkTo(int sceneX, int sceneY) {
-    doAction(sceneX, sceneY, off::OP_WALK, 0);
+/// Walk to a SCENE tile. The game pathfinds and sends the movement itself; we only say where. Returns
+/// false when the action was dropped (see doAction) -- do not treat that as "walking".
+inline bool walkTo(int sceneX, int sceneY) {
+    return doAction(sceneX, sceneY, off::OP_WALK, 0);
 }
 
 /// Interact with an NPC by uid -- attack it, talk to it, pickpocket it, whatever `opcode` selects.
 ///
 /// The uid IS the target: the client looks the NPC up in the same hashtable we walked to find it, so we
 /// do not have to care where it has moved to since. We still pass its tile because that is the shape
-/// doAction wants, and we look it up here so callers only need the uid.
-inline void interactNpc(int uid, int opcode) {
+/// doAction wants, and we look it up here so callers only need the uid. Returns false when the uid did
+/// not resolve (it despawned this frame) or the action was dropped (see doAction).
+inline bool interactNpc(int uid, int opcode) {
     bool found = false;
     Entity target;
     forEachEntity([&](const Entity& e) {
@@ -449,8 +481,8 @@ inline void interactNpc(int uid, int opcode) {
         target = e;
         found = true;
     });
-    if (!found) return;
-    doAction(target.sceneX, target.sceneY, opcode, uid);
+    if (!found) return false;
+    return doAction(target.sceneX, target.sceneY, opcode, uid);
 }
 
 }  // namespace kk
