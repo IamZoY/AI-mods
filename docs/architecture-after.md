@@ -3,7 +3,8 @@
 The "after" picture, mirroring [`architecture-before.md`](architecture-before.md) section for section:
 what the migration built, where the Java/native lines run now, and what each piece owns. Everything
 here was read out of the sources on this branch on 2026-09-05 and re-verified by a clean
-`sh gradlew test` (332 tests, 0 failures, 30 classes) and `sh tools/wine-setup.sh` (zero errors).
+`sh gradlew test` (402 tests, 0 failures, 40 classes -- last recorded run 2026-09-06) and
+`sh tools/wine-setup.sh` (zero errors).
 The bridge contract summary is section 3; the byte-level detail stays where it belongs, in the
 `static_assert`ed headers that enforce it.
 
@@ -21,7 +22,7 @@ changed is who draws the control panel and where its state lives:
     │  KewlKlient.exe (ImGui)  │ spawn    │  osclient.exe                            │
     │  "+ client" button  ─────┼────────> │   └─ kewlklient.dll (injected)           │
     │  reads the model region  │  inject  │       reads memory, starts a JVM ────────┼──> kewlklient.jar
-    │  writes the edit ring    │<════════>│       21 natives, Java2D overlays        │      api + your plugins
+    │  writes the edit ring    │<════════>│       25 natives, Java2D overlays        │      api + your plugins
     │  software-raster ImGui   │  shared  │       PluginManager, ProfileManager, Hub │      plugin state + profiles
     └──────────────────────────┘  memory  └──────────────────────────────────────────┘
 ```
@@ -206,13 +207,16 @@ All new code lives in small packages under `java/kewl/`; none of it widens the J
   code default. A non-daemon shutdown hook is the last chance the profile store gets, because the
   process dies with the game without warning.
 
-## 5. Plugin inventory (unchanged, plus the seam externals join through)
+## 5. Plugin inventory (the registry is still the registry, plus the seam externals join through)
 
 `KewlKlient.PLUGINS` is still a static `List.of(...)` and the list is still the registry — no
 scanning, no annotation processor. `KewlKlient.plugins()` now returns the *manager's* live list once
 one is installed, so hub-registered plugins appear in the same order-based index space the edit
-records name. Same five built-ins as before: PlayerVisuals, NpcVisuals, Woodcutter,
-RlitePlugin("Shortest Path"), RlitePlugin("Test Rlite"). The ported Shortest Path is unchanged:
+records name. Ten entries as of 2026-09-06: PlayerVisuals, NpcVisuals, Woodcutter,
+RlitePlugin("Shortest Path"), RlitePlugin("NPC Indicators"), RlitePlugin("Player Indicators"),
+RlitePlugin("Test Rlite"), RlitePlugin("Test Actors"), AutoLogin, AntiIdle -- the two Indicators
+ports are the only ones in `defaultOn()`. New entries are APPENDED, because edit records address a
+plugin by its index in this list. The ported Shortest Path is unchanged:
 eager object graph via `kewl.rl.Injector`, 79 proxied RuneLite settings + `autoWalk`, pathfinding on
 its own single-thread executor with results marshalled to the frame thread via `ClientThread`.
 

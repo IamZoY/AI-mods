@@ -433,7 +433,10 @@ public class Transport
 			{
 				try
 				{
-					this.duration = Integer.parseInt(value);
+					// trim: the TSVs carry trailing spaces on some duration cells ("1    "), and
+					// parseInt refuses them -- seen live 2026-09-05 as "[error] Transport: Invalid tick
+					// duration: 1    ", which silently dropped that transport's duration.
+					this.duration = Integer.parseInt(value.trim());
 				}
 				catch (NumberFormatException e)
 				{

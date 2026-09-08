@@ -47,15 +47,22 @@ public final class Setting {
     private final int min, max;
     private final Object[] options;
     private final Object defaultValue;
+    private final boolean secret;
     private Object value;
     private final List<Runnable> listeners = new ArrayList<>();
 
     Setting(String key, String label, String description, Kind kind, Object value, int min, int max) {
-        this(key, label, description, kind, value, min, max, null);
+        this(key, label, description, kind, value, min, max, null, false);
     }
 
     /** For {@link Kind#ENUM}: {@code options} are the constants the panel offers, in order. */
     Setting(String key, String label, String description, Kind kind, Object value, int min, int max, Object[] options) {
+        this(key, label, description, kind, value, min, max, options, false);
+    }
+
+    /** The full form; {@code secret} is only meaningful for {@link Kind#TEXT} (see {@link #secret()}). */
+    Setting(String key, String label, String description, Kind kind, Object value, int min, int max,
+            Object[] options, boolean secret) {
         this.key = key;
         this.label = label;
         this.description = description;
@@ -65,6 +72,7 @@ public final class Setting {
         this.min = min;
         this.max = max;
         this.options = options;
+        this.secret = secret;
     }
 
     /** The name you look it up by. */
@@ -83,6 +91,29 @@ public final class Setting {
 
     /** The constants an ENUM offers, in panel order. Null for every other kind. */
     public Object[] options() { return options; }
+
+    /**
+     * A TEXT setting whose value must never be shown or logged in clear -- a password. It is a
+     * display concern only: the value is stored, persisted, edited and reset exactly like any other
+     * TEXT setting (the launcher has to be able to type into it), but every place that RENDERS or
+     * PRINTS a setting's text must go through {@link #displayText()} and mask it. Nothing in this
+     * class derives anything from the value for a secret -- not even its length.
+     */
+    public boolean secret() { return secret; }
+
+    /**
+     * The text to draw or log for this setting: the value itself for an ordinary TEXT setting, and
+     * for a secret one only whether it is set -- a fixed mask, never a length. Not a hint that the
+     * mask is the value's width: a masked password that gave away its length would still be a fact
+     * about the password.
+     */
+    public String displayText() {
+        if (!secret) return asText();
+        return asText().isEmpty() ? "(empty)" : SECRET_MASK;
+    }
+
+    /** What every masked secret shows, whatever its length. */
+    public static final String SECRET_MASK = "\u2022\u2022\u2022\u2022";
 
     /**
      * What it was declared with: the value a fresh plugin starts on, and the value {@link #reset}

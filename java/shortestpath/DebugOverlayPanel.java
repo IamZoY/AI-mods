@@ -31,7 +31,13 @@ public class DebugOverlayPanel extends OverlayPanel
 		separator = new SeparatorLine();
 		separator.setColor(new Color(0, true)); // Invisible color
 
-		setPosition(OverlayPosition.TOP_LEFT);
+		// KEWL DEVIATION from upstream shortest-path, which sets TOP_LEFT here. The user asked for the
+		// debug panel on the RIGHT. TOP_RIGHT is not used because kewl's overlay rectangle is the whole
+		// game client area rather than RuneLite's viewport widget, so a top-right panel lands under the
+		// MINIMAP -- and the minimap's true canvas rectangle is not knowable while widget x/y are
+		// parent-relative (see the project's ground truth). BOTTOM_RIGHT is the right-hand corner that
+		// is clear of it.
+		setPosition(OverlayPosition.BOTTOM_RIGHT);
 	}
 
 	private LineComponent makeLine(String left, String right)

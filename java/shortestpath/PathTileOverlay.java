@@ -157,10 +157,21 @@ public class PathTileOverlay extends Overlay
 		}
 	}
 
+	private int diagFrames = 0;
+
 	@Override
 	public Dimension render(Graphics2D graphics)
 	{
 		playerTileLabelOffset = 0;
+		// Diagnostic trail for the live pass (2026-09-06): one line per ~10 s saying whether this
+		// overlay has a path to draw at all, gated like the DLL's probes.
+		if (System.getenv("KEWL_LOG") != null && (diagFrames++ % 300) == 0)
+		{
+			System.out.println("[shortestpath] tile overlay: drawTiles=" + plugin.drawTiles
+				+ " pathfinder=" + (plugin.getPathfinder() == null ? "null" : "set")
+				+ " path=" + (plugin.getPathfinder() == null || plugin.getPathfinder().getPath() == null
+					? "null" : plugin.getPathfinder().getPath().size() + " steps"));
+		}
 
 		if (plugin.drawTransports)
 		{

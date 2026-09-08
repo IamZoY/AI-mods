@@ -41,6 +41,9 @@ public class RlitePlugin extends Plugin
 	private Set<Overlay> ownedOverlays = Set.of();
 	/** The auto-walk driver, wired in build() when the wrapped plugin produces paths. */
 	private AutoWalk autoWalk;
+
+	/** Whether to echo the walker's status line to the log; see the tick site for why. */
+	private static final boolean LOG_STATUS = System.getenv("KEWL_LOG") != null;
 	/** Kept from build() so key edges can be dispatched to the plugin's registered hotkeys. */
 	private KeyManager keyManager;
 	/** Synthetic source for dispatched KeyEvents; a KeyEvent refuses a null source. */
@@ -56,13 +59,6 @@ public class RlitePlugin extends Plugin
 		this.displayName = name;
 		this.displayDescription = description;
 		this.factory = factory;
-		// Default ON, unlike upstream Shortest Path, which never issues a single step: its path is
-		// guidance, and the user walks it. Kewl's user asked for the client to walk the path, and a
-		// "Set target" that draws tiles but never moves reads as the plugin being broken -- the first
-		// run should end with the character arriving. The toggle stays, right here in the panel.
-		config.bool("autoWalk", "Auto-walk",
-			"Walk the computed path automatically. Stops at plane changes (boats, stairs, teleports).",
-			true);
 		build();
 	}
 
@@ -97,7 +93,21 @@ public class RlitePlugin extends Plugin
 
 		try
 		{
-			plugin = injector.build(factory.get());
+			net.runelite.client.plugins.Plugin built = factory.get();
+			// Auto-walk is Shortest Path's toggle, not the adapter's: declared here, BEFORE injection
+			// declares the plugin's own config items, so Shortest Path's panel order is unchanged --
+			// and declared ONLY for it, so NPC/Player Indicators and the smoke tests do not grow a
+			// toggle that does nothing. Default ON, unlike upstream, which never issues a single
+			// step: its path is guidance and the user walks it. Kewl's user asked for the client to
+			// walk the path, and a "Set target" that draws tiles but never moves reads as the plugin
+			// being broken -- the first run should end with the character arriving.
+			if (built instanceof shortestpath.ShortestPathPlugin)
+			{
+				config.bool("autoWalk", "Auto-walk",
+					"Walk the computed path automatically. Stops at plane changes (boats, stairs, teleports).",
+					true);
+			}
+			plugin = injector.build(built);
 		}
 		catch (Throwable t)
 		{
@@ -214,6 +224,8 @@ public class RlitePlugin extends Plugin
 		{
 			return;
 		}
+		logPlaneUnreadableOnce();
+		logShimGapsOnce();
 		ClientThread.drain();
 		dispatchKeyEdges();
 		events.fire();
@@ -225,11 +237,104 @@ public class RlitePlugin extends Plugin
 			menuPopup.tick();
 		}
 
-		if (autoWalk != null && config.bool("autoWalk"))
+		if (autoWalk != null)
 		{
-			autoWalkStatus = autoWalk.tick();
+			if (config.bool("autoWalk"))
+			{
+				String before = autoWalkStatus;
+				autoWalkStatus = autoWalk.tick();
+				// The walker's decision reaches the SIDE PANEL and nowhere else, so a stand-down is
+				// invisible to anyone reading a log -- which is how a live test on 2026-09-07 got as far
+				// as "the path is drawn, the character never moves" with nothing to say why. One line per
+				// CHANGE (never per frame), and only under KEWL_LOG.
+				if (LOG_STATUS && autoWalkStatus != null && !autoWalkStatus.equals(before))
+				{
+					System.out.println("[autowalk] " + autoWalkStatus);
+				}
+			}
+			else if (autoWalkStatus != null)
+			{
+				// The toggle went off. Without this the panel keeps the last line the driver wrote
+				// ("walking to 3200,3200 (step 4/20)") for the rest of the session, which reads as a
+				// walk still running -- and the driver would resume with the old path's cursor and
+				// "already walking toward" target the next time it is switched back on (review
+				// 2026-09-06). Cleared once, not every frame, so status() falls back to the hosted
+				// plugin's own line.
+				autoWalkStatus = null;
+				autoWalk.reset();
+			}
 		}
 	}
+
+	/**
+	 * One line per login when the native could not read the local player's plane (-1: ENTITY_PLANE
+	 * is SUSPECT this build, client/offsets.hpp). The RuneLite shim's WorldView.getPlane() then
+	 * assumes the ground floor so pathing still works; this makes that assumption visible in the
+	 * KEWL_LOG trace instead of silent. Re-arms once a real plane is read (e.g. after a hop), so a
+	 * relog that loses the plane again is logged again.
+	 *
+	 * <p>The flag is STATIC (review 2026-09-06): the plane is a property of the client, not of a
+	 * plugin, and every enabled RlitePlugin runs this check every frame -- with a per-instance flag,
+	 * three hosted plugins printed three identical lines per login, all tagged [shortestpath]. One
+	 * line per login now, whichever instance happens to reach it first. The tag stays as-is because
+	 * PROGRESS.md's plane-debugging notes quote it verbatim.</p>
+	 */
+	private void logPlaneUnreadableOnce()
+	{
+		kewl.api.Local me = kewl.api.Game.me();
+		if (!me.exists())
+		{
+			return;
+		}
+		if (me.plane() < 0)
+		{
+			if (!planeUnreadableLogged)
+			{
+				planeUnreadableLogged = true;
+				System.out.println("[shortestpath] plane unreadable (-1 from the client), assuming ground floor");
+			}
+		}
+		else
+		{
+			planeUnreadableLogged = false;
+		}
+	}
+
+	private static boolean planeUnreadableLogged;
+
+	/**
+	 * The shim's own account of what it faked, printed ONCE per session into the KEWL_LOG trace,
+	 * after the hosted plugins have had a few seconds to actually call things.
+	 *
+	 * <p>Why a delay rather than a line at startUp: {@link net.runelite.api.ShimSupport} only knows
+	 * about accessors that have been CALLED, which is what keeps the report scoped to what this
+	 * session really depends on. Printed immediately it would say "nothing stubbed" and be useless;
+	 * printed after a few hundred frames of overlays rendering, it is the list of every placeholder
+	 * the running plugins actually hit -- the document a report like "the camera shows zeros" gets
+	 * answered from. Each accessor has already logged its own line the first time it was reached;
+	 * this is the summary, and it is deliberately the only place the whole list appears at once.</p>
+	 *
+	 * <p>STATIC, like the plane flag above and for the same reason: the gaps belong to the shim, not
+	 * to a plugin, so three enabled RlitePlugins must not print three copies.</p>
+	 */
+	private static void logShimGapsOnce()
+	{
+		if (shimGapsLogged || kewl.KewlKlient.frame() < SHIM_REPORT_FRAME)
+		{
+			return;
+		}
+		shimGapsLogged = true;
+		System.out.println(net.runelite.api.ShimSupport.report());
+	}
+
+	/**
+	 * Frames to wait before the shim-gap summary. ~10 seconds at kewl's frame pace: long enough for
+	 * a login and a few hundred overlay renders, short enough to be in the log before the user has
+	 * finished doing whatever they are about to report.
+	 */
+	private static final int SHIM_REPORT_FRAME = 500;
+
+	private static boolean shimGapsLogged;
 
 	/**
 	 * Hand this frame's key edges to the plugin's registered hotkey listeners as ordinary KeyEvents --
@@ -287,7 +392,25 @@ public class RlitePlugin extends Plugin
 		{
 			return "failed to construct";
 		}
-		return autoWalkStatus != null ? autoWalkStatus : "";
+		if (autoWalkStatus != null)
+		{
+			return autoWalkStatus;
+		}
+		// A hosted plugin that publishes its own status line (TestActors); see StatusSource.
+		if (plugin instanceof StatusSource s)
+		{
+			String st = s.status();
+			if (st != null && !st.isEmpty())
+			{
+				return st;
+			}
+		}
+		// Nothing else to say: name the shim placeholders this session has actually hit, rather than
+		// leaving the line blank. A blank line reads as "all well", which is the exact impression
+		// that made "the camera shows zeros" impossible to act on -- and this line only ever appears
+		// when a running plugin has genuinely read a faked value, so on a clean session it is still
+		// empty. See net.runelite.api.ShimSupport.
+		return net.runelite.api.ShimSupport.status();
 	}
 
 	/** Last non-null status from the auto-walk driver, for the control panel. */

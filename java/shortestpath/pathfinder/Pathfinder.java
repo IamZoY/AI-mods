@@ -317,6 +317,9 @@ public class Pathfinder implements Runnable
 		}
 
 		done = !cancelled;
+		// Diagnostic trail for the live pass (2026-09-06): how the search ended and how long the path is.
+		System.out.println("[shortestpath] pathfinder finished: " + terminationReason + ", path steps="
+			+ (getPath() == null ? "null" : String.valueOf(getPath().size())));
 
 		boundary.clear();
 		visited.clear();

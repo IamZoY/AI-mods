@@ -33,6 +33,9 @@ public class ItemDefinition
 
 	public boolean isStackable()
 	{
+		ShimSupport.note("ItemDefinition.isStackable", ShimSupport.Kind.NEEDS_CACHE_DATA,
+			"reads false for EVERY item, coins and runes included: stackability is cache data and no"
+				+ " item table is bundled. A caller counting a stack sees one item");
 		return false;
 	}
 }

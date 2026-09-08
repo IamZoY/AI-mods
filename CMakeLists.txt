@@ -70,7 +70,8 @@ target_include_directories(kewl_imgui PUBLIC third_party/imgui client)
 # ---------------------------------------------------------------------------------------------------
 add_library(kewl_dll SHARED client/dllmain.cpp)
 target_include_directories(kewl_dll PRIVATE client ${JNI_INCLUDE_DIRS})
-target_link_libraries(kewl_dll PRIVATE user32 gdi32 kewl_imgui)
+# version: GetFileVersionInfoW, for the build fingerprint check against the host exe (offsets.hpp).
+target_link_libraries(kewl_dll PRIVATE user32 gdi32 version kewl_imgui)
 set_target_properties(kewl_dll PROPERTIES PREFIX "" OUTPUT_NAME "kewlklient")
 
 if(MINGW)

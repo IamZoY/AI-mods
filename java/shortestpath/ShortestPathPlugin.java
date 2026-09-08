@@ -292,6 +292,17 @@ public class ShortestPathPlugin extends Plugin
 		return configManager.getConfig(ShortestPathConfig.class);
 	}
 
+	/**
+	 * Kewl addition, not upstream: the pace {@code kewl.rl.AutoWalk} clicks at, in game ticks. Read
+	 * live rather than from the cacheConfigValues snapshot so a user dragging the slider while a walk
+	 * is running sees it take effect on the next click. Zero before injection has run; the driver
+	 * floors it.
+	 */
+	public int getAutoWalkClickDelay()
+	{
+		return config == null ? 0 : config.autoWalkClickDelay();
+	}
+
 	@Override
 	protected void startUp()
 	{
@@ -359,12 +370,18 @@ public class ShortestPathPlugin extends Plugin
 			{
 				if (ends.isEmpty())
 				{
+					System.out.println("[shortestpath] every target was filtered out -- nothing to path to");
 					setTarget(WorldPointUtil.UNDEFINED);
 				}
 				else
 				{
 					pathfinder = new Pathfinder(pathfinderConfig, start, ends, this::postPluginMessages);
 					pathfinderFuture = pathfindingExecutor.submit(pathfinder);
+					// Diagnostic trail for the live pass (2026-09-06): the start tile and target count
+					// the worker was handed, so a silent "no tiles drawn" can be placed.
+					System.out.println("[shortestpath] pathfinding from " + WorldPointUtil.unpackWorldX(start) + ","
+						+ WorldPointUtil.unpackWorldY(start) + "," + WorldPointUtil.unpackWorldPlane(start)
+						+ " to " + ends.size() + " target(s)");
 				}
 			}
 		});
@@ -721,9 +738,10 @@ public class ShortestPathPlugin extends Plugin
 
 		if (map != null)
 		{
-			if (map.getBounds().contains(
-				client.getMouseCanvasPosition().getX(),
-				client.getMouseCanvasPosition().getY()))
+			// kewl: mouseIsOverUsableMap(), not a bare contains() -- the rectangle is only a canvas
+			// rectangle when the chain resolved, and offering "Set target" over a map whose click
+			// cannot be inverted just produces a menu entry that silently sets nothing.
+			if (mouseIsOverUsableMap())
 			{
 				addMenuEntry(event, SET, TARGET, 0);
 				if (pathfinder != null)
@@ -1287,18 +1305,33 @@ public class ShortestPathPlugin extends Plugin
 
 	private void onMenuOptionClicked(MenuEntry entry)
 	{
+		// kewl: every SET row resolves through setTargetFromSelection/the guarded setStart below, never
+		// through setTarget(getSelectedWorldPoint()) directly. UNDEFINED is BOTH "the click could not be
+		// turned into a tile" and "clear the target", and setTargets(empty) is a full teardown -- cancel
+		// the pathfinder, null it, drop the marker, clear startPointSet. Passing a failed resolve
+		// straight in is what made "Set target" wipe the plugin (user report 2026-09-07). The CLEAR row
+		// below still calls setTarget(UNDEFINED) and still clears, which is the point: only an explicit
+		// clear clears.
 		if (entry.getOption().equals(SET) && entry.getTarget().equals(TARGET))
 		{
-			setTarget(getSelectedWorldPoint());
+			setTargetFromSelection(false);
 		}
 		else if (entry.getOption().equals(SET) && pathfinder != null && entry.getTarget().equals(TARGET +
 			ColorUtil.wrapWithColorTag(" " + (pathfinder.getTargets().size() + 1), JagexColors.MENU_TARGET)))
 		{
-			setTarget(getSelectedWorldPoint(), true);
+			setTargetFromSelection(true);
 		}
 		else if (entry.getOption().equals(SET) && entry.getTarget().equals(START))
 		{
-			setStart(getSelectedWorldPoint());
+			int selectedStart = getSelectedWorldPoint();
+			if (selectedStart == WorldPointUtil.UNDEFINED)
+			{
+				// setStart(UNDEFINED) is not inert either: it sets startPointSet and restarts the
+				// pathfinder from a non-tile, which strands the path at the origin.
+				noteSelectionFailure("\"Set start\" could not be resolved to a tile");
+				return;
+			}
+			setStart(selectedStart);
 		}
 		else if (entry.getOption().equals(CLEAR) && entry.getTarget().equals(PATH))
 		{
@@ -1310,33 +1343,368 @@ public class ShortestPathPlugin extends Plugin
 		}
 	}
 
+	/**
+	 * Where the tile a "Set target" click means is allowed to come from.
+	 *
+	 * <p>Named branches rather than nested ifs, because the branch table IS the bug this replaces: an
+	 * older version made the SCENE branch exclusive to "the map looks closed", so once the world-map
+	 * group had been loaded even once, a right-click on the SCENE fell through to a map branch that
+	 * cannot resolve on this build and returned UNDEFINED -- and setTarget(UNDEFINED) is a CLEAR, so
+	 * pressing "Set target" tore down the path the user had just asked for. That is the user's report
+	 * of 2026-09-07 ("shortestpath doesnt do anything when setting a target").</p>
+	 *
+	 * <p>The next version over-corrected and produced the user's SECOND report of the same day: "when i
+	 * open the worldmap and choose a location in it. its fucked up because it chooses on the gamescreen
+	 * not worldmap". Everything that was not a trusted map click fell through to the scene, so a click
+	 * ON THE OPEN MAP -- whose rectangle this build cannot resolve -- silently became a target at
+	 * whatever scene tile happened to be parked underneath. The three refusal constants below exist so
+	 * that case has somewhere to go that is neither "the map" nor "the scene".</p>
+	 */
+	enum SelectionSource
+	{
+		/** (a) on screen, (b) inside it, (c) invertible. Invert the click through the map projection. */
+		MAP,
+		/** (b) answered NO, or (a) said the map is not on screen. Use the parked scene tile. */
+		SCENE,
+		/**
+		 * (a) YES, (b) UNANSWERABLE -- the map is on screen and we cannot tell whether this click was
+		 * on it. Resolves to nothing, on purpose. See {@link #selectionSourceFor} for why this is not
+		 * allowed to fall through to the scene.
+		 */
+		MAP_CONTAINMENT_UNKNOWN,
+		/**
+		 * (a) YES, (b) YES, (c) NO -- the click really is on the map and the map cannot turn it into a
+		 * tile. Resolves to nothing; the inversion refusal names the one action that unblocks it.
+		 */
+		MAP_NOT_INVERTIBLE,
+		/** Nothing to resolve to at all: the map is not on screen and no scene tile is parked. */
+		NONE
+	}
+
+	/** True for every branch that means "leave the existing target exactly as it is". */
+	static boolean isRefusal(SelectionSource source)
+	{
+		return source == SelectionSource.MAP_CONTAINMENT_UNKNOWN
+			|| source == SelectionSource.MAP_NOT_INVERTIBLE
+			|| source == SelectionSource.NONE;
+	}
+
+	/**
+	 * Escape hatch for the one failure mode the design below deliberately accepts. Read once, off a
+	 * property, so it cannot be flipped by anything the client does at runtime.
+	 *
+	 * <p>{@code -Dkewl.shortestpath.sceneUnderOpenMap=true} restores the old behaviour: while the map
+	 * is on screen and containment is unanswerable, resolve from the scene anyway. It exists because
+	 * the refusal is keyed on {@code Widget.isHidden()} for the world-map group, and if that ever
+	 * misreports a CLOSED map as open, "Set target" on the scene would stop working with no way back
+	 * short of a rebuild. The refusal message names this flag, so that state is one log line and one
+	 * flag from being recoverable instead of a rebuild. Default false: the failure it restores is the
+	 * one the user actually reported.</p>
+	 */
+	static final String SCENE_UNDER_OPEN_MAP_PROPERTY = "kewl.shortestpath.sceneUnderOpenMap";
+
+	private static final boolean SCENE_UNDER_OPEN_MAP =
+		Boolean.getBoolean(SCENE_UNDER_OPEN_MAP_PROPERTY);
+
+	/**
+	 * The whole branch table, pure so it can be asserted without a client.
+	 *
+	 * <p>THREE QUESTIONS, asked in order, each with its own input. They used to be two, and the missing
+	 * one is why a click on the open map became a scene target:</p>
+	 *
+	 * <ol>
+	 *   <li>(a) IS THE MAP ON SCREEN? {@code mapOnScreen}, from {@link WorldMap#presenceRefusalFor} --
+	 *       loaded and not hidden, and nothing else. No rectangle, no scale.</li>
+	 *   <li>(b) DID THIS CLICK LAND ON IT? {@code containmentRefusal == null} says the question is
+	 *       ANSWERABLE (the rectangle is a real canvas rectangle); {@code clickInsideMapRect} is the
+	 *       answer, and is meaningless when the refusal is non-null.</li>
+	 *   <li>(c) CAN THIS POINT BECOME A TILE? {@code inversionRefusal == null}. Needs the centre and
+	 *       the scale on top of the rectangle.</li>
+	 * </ol>
+	 *
+	 * <p>THE DECISION, stated plainly because it trades one failure for another. When (a) is yes and
+	 * (b) is UNANSWERABLE, this REFUSES ({@link SelectionSource#MAP_CONTAINMENT_UNKNOWN}) rather than
+	 * falling back to the scene. The two failure modes:</p>
+	 *
+	 * <ul>
+	 *   <li>REFUSING: "Set target" does nothing while the map is open, and says why in one line. The
+	 *       user recovers by closing the map -- the scene path is untouched and works immediately.</li>
+	 *   <li>FALLING BACK: the user gets a target they did not pick, computed from a scene tile under a
+	 *       map they were looking at, and auto-walk then walks there. Nothing about it looks wrong.</li>
+	 * </ul>
+	 *
+	 * <p>Refusing is chosen. A refusal is visible, one action from recovery, and cannot move the
+	 * character; a wrong target is invisible, and the user has now reported it as a bug. "No target" is
+	 * a worse product than "the right target" and a better one than "a target somewhere else".</p>
+	 *
+	 * <p>THE LOAD-BEARING CONSTRAINT, and how it is made structural rather than merely likely: a scene
+	 * right-click WITH THE MAP CLOSED must keep working. That is the regression fixed hours earlier and
+	 * it must not come back. The guarantee is the FIRST statement of this method -- when
+	 * {@code mapOnScreen} is false the method returns from the scene/none pair and no map input is read
+	 * at all. Not a condition among conditions: an early return, above every line that mentions the
+	 * map, so no future addition to the map reasoning can be reached in that state. {@code mapOnScreen}
+	 * comes from presence only, so a geometry misread cannot manufacture an open map either.
+	 * {@code SelectedWorldPointBranchTest} asserts it exhaustively: for BOTH scene states and all
+	 * combinations of every other input, {@code mapOnScreen == false} yields SCENE or NONE and never a
+	 * refusal.</p>
+	 *
+	 * <p>Where (b) answers NO, the scene tile is the answer, exactly as before. That is safe here for a
+	 * reason specific to this client: kewl's MenuPopup parks the tile the right-click landed on when it
+	 * opens (MenuPopup.open), and WorldView.getSelectedSceneTile() hands that parked tile back for as
+	 * long as the menu is up. So while the user is looking at the popup row they are about to click,
+	 * the "selected scene tile" is exactly where they right-clicked.</p>
+	 */
+	static SelectionSource selectionSourceFor(boolean mapOnScreen, String containmentRefusal,
+		boolean clickInsideMapRect, String inversionRefusal, boolean sceneTileAvailable,
+		boolean sceneFallbackUnderOpenMap)
+	{
+		// (a) THE MAP IS NOT ON SCREEN. Structural guarantee: this is the first statement and it
+		// returns, so with the map closed or never opened nothing below can run, whatever it comes to
+		// say about rectangles. The scene click cannot be taken away by map reasoning it never reaches.
+		if (!mapOnScreen)
+		{
+			return sceneTileAvailable ? SelectionSource.SCENE : SelectionSource.NONE;
+		}
+
+		// (b) UNANSWERABLE: the map is up and its rectangle is not a canvas rectangle, so "was this
+		// click on the map?" has no answer. Refuse -- see the decision in this method's doc.
+		if (containmentRefusal != null)
+		{
+			if (sceneFallbackUnderOpenMap)
+			{
+				return sceneTileAvailable ? SelectionSource.SCENE : SelectionSource.NONE;
+			}
+			return SelectionSource.MAP_CONTAINMENT_UNKNOWN;
+		}
+
+		// (b) NO: answerable, and the answer is that the click was outside the map. The scene owns it.
+		if (!clickInsideMapRect)
+		{
+			return sceneTileAvailable ? SelectionSource.SCENE : SelectionSource.NONE;
+		}
+
+		// (b) YES from here down: the click is ON THE MAP. The scene is no longer a candidate for it at
+		// all -- whatever tile is parked under the map is not what the user pointed at.
+		if (inversionRefusal != null)
+		{
+			return SelectionSource.MAP_NOT_INVERTIBLE;
+		}
+		return SelectionSource.MAP;
+	}
+
 	private int getSelectedWorldPoint()
 	{
-		if (client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER) == null)
+		net.runelite.api.widgets.Widget mapContainer = client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER);
+		// The point this click is resolved from -- the same one the map branch inverts. A menu is open
+		// by the time the entry is invoked, so the live cursor has already moved off the row the user
+		// aimed at; lastMenuOpenedPoint is where they actually right-clicked.
+		Point click = client.isMenuOpen() && lastMenuOpenedPoint != null
+			? lastMenuOpenedPoint : client.getMouseCanvasPosition();
+		// The three questions, each asked of the thing it actually needs. (a) touches no geometry, so
+		// the scene fallback below cannot be lost to a rectangle that failed to resolve.
+		String presenceRefusal = WorldMap.presenceRefusalFor(mapContainer);
+		String containmentRefusal = WorldMap.containmentRefusalFor(mapContainer);
+		String inversionRefusal = WorldMap.inversionRefusalFor(mapContainer, client.getWorldMap());
+		// pointIsOnMapSurface is the identical containment test the MENU asks, so the entry that is
+		// offered and the resolver that answers it cannot disagree.
+		boolean insideMap = pointIsOnMapSurface(mapContainer, click);
+		net.runelite.api.Tile sceneTile = client.getTopLevelWorldView().getSelectedSceneTile();
+		SelectionSource source = selectionSourceFor(presenceRefusal == null, containmentRefusal,
+			insideMap, inversionRefusal, sceneTile != null, SCENE_UNDER_OPEN_MAP);
+
+		if (System.getenv("KEWL_LOG") != null)
 		{
-			if (client.getTopLevelWorldView().getSelectedSceneTile() != null)
-			{
-				return WorldPointUtil.fromLocalInstance(client, client.getTopLevelWorldView().getSelectedSceneTile().getLocalLocation());
-			}
+			// One line, and it says WHICH QUESTION failed: a(on screen) / b(on the map) / c(invertible).
+			// A live report of "set target did nothing" has to be diagnosable from this line alone.
+			System.out.println("[shortestpath] selected world point: branch=" + source
+				+ (isRefusal(source) ? " (REFUSED -- nothing resolved, the target is left alone)" : "")
+				+ " a(onScreen)=" + (presenceRefusal == null ? "YES" : "NO: " + presenceRefusal)
+				+ " b(onMap)=" + (containmentRefusal != null
+					? "UNANSWERABLE: " + containmentRefusal : (insideMap ? "YES" : "NO"))
+				+ " c(invertible)=" + (inversionRefusal == null ? "YES" : "NO: " + inversionRefusal)
+				+ " click=" + (click == null ? "null" : click.getX() + "," + click.getY())
+				+ " sceneTile=" + sceneTile);
 		}
-		else
+
+		switch (source)
 		{
-			// A map click turns into a target through calculateMapPoint, which is anchored on the
-			// shim's WorldMap centre. Until Events reports that centre live, the conversion would land
-			// on whatever stale tile the placeholder pointed at, and with auto-walk on the client
-			// quietly starts walking there. So while the map data is not live a map click simply sets
-			// nothing. (The gate is the liveness flag, not the position's sign: a real centre can sit
-			// at or below x=0 in principle, and the old getX() <= 0 check only worked by coincidence
-			// with the placeholder being (0,0).)
-			if (!client.getWorldMap().isLive())
+			case MAP:
 			{
-				return WorldPointUtil.UNDEFINED;
+				// A map click becomes a target through calculateMapPoint, which is the FORWARD map
+				// projection run backwards, so it inherits every error the forward one has. We only get
+				// here once question (c) has vouched for the rectangle AND the centre AND the scale --
+				// the same predicate the map overlays draw on.
+				int mapPoint = calculateMapPoint(click.getX(), click.getY());
+				if (mapPoint == WorldPointUtil.UNDEFINED)
+				{
+					// The map branch was legitimately taken and still could not answer. That failure
+					// belongs to THIS click alone: no scene answer is being deleted, and it is not the
+					// user asking to clear the path.
+					return failSelection("(c) the world-map click at " + click.getX() + "," + click.getY()
+						+ " is on the map and could not be inverted into a tile");
+				}
+				selectionFailure = null;
+				return mapPoint;
 			}
-			return client.isMenuOpen()
-				? calculateMapPoint(lastMenuOpenedPoint.getX(), lastMenuOpenedPoint.getY())
-				: calculateMapPoint(client.getMouseCanvasPosition().getX(), client.getMouseCanvasPosition().getY());
+			case SCENE:
+				// Both notes below are gated on the map being ON SCREEN. A closed or never-opened map
+				// explaining why it cannot resolve clicks is pure noise -- that is its ordinary state,
+				// and the scene is the only surface anyone is asking about.
+				if (presenceRefusal != null)
+				{
+					// Nothing to say: the map is not up, the scene answered, that is the normal path.
+					selectionFailure = null;
+					return WorldPointUtil.fromLocalInstance(client, sceneTile.getLocalLocation());
+				}
+				if (containmentRefusal != null)
+				{
+					// Reachable only under the escape-hatch property, since without it an unanswerable
+					// containment refuses. Said once, and deliberately NOT phrased as "your click was
+					// refused": this click WAS answered, from the scene.
+					noteMapRefusal("the world map cannot say whether a click is on it ("
+						+ containmentRefusal + ") and -D" + SCENE_UNDER_OPEN_MAP_PROPERTY + "=true is set,"
+						+ " so clicks are being resolved from the SCENE while the map is open. A click ON"
+						+ " the map will set a target somewhere you did not choose");
+				}
+				else if (inversionRefusal != null)
+				{
+					noteMapRefusal("the world map cannot resolve clicks (" + inversionRefusal + ")."
+						+ " Right-clicking a tile in the scene still sets a target and is what is being"
+						+ " used");
+				}
+				selectionFailure = null;
+				return WorldPointUtil.fromLocalInstance(client, sceneTile.getLocalLocation());
+			case MAP_CONTAINMENT_UNKNOWN:
+				// (a) yes, (b) unanswerable. The deliberate refusal: the user is looking at the open map,
+				// and the scene tile parked underneath is not what they pointed at. Close the map and the
+				// scene path works immediately -- that recovery is why this is a refusal and not a guess.
+				return failSelection("(b) the WORLD MAP IS OPEN and this build cannot say whether the"
+					+ " click at " + (click == null ? "?" : click.getX() + "," + click.getY())
+					+ " landed on it (" + containmentRefusal + "). Refusing on purpose: resolving it from"
+					+ " the scene would set a target at whatever tile is under the map, which is not what"
+					+ " was clicked. CLOSE THE WORLD MAP and right-click the tile in the game scene --"
+					+ " that path is unaffected. To resolve from the scene anyway, -D"
+					+ SCENE_UNDER_OPEN_MAP_PROPERTY + "=true");
+			case MAP_NOT_INVERTIBLE:
+				// (a) yes, (b) yes, (c) no. The click really is on the map; the map just cannot invert it
+				// yet. The refusal carries the one action that fixes it (calibrate the scale by dragging).
+				return failSelection("(c) the click at "
+					+ (click == null ? "?" : click.getX() + "," + click.getY())
+					+ " IS on the open world map, and the map cannot turn it into a tile ("
+					+ inversionRefusal + ")");
+			default:
+				// No scene tile parked and no map click to invert. There is nothing to resolve TO, so the
+				// caller must leave whatever target already exists exactly as it is.
+				return failSelection(presenceRefusal == null
+					? "no scene tile was selected for this click, and the click was not on the world map"
+					: "(a) no scene tile was selected for this click and " + presenceRefusal);
 		}
+	}
+
+	/** Last map-geometry refusal mentioned; keyed on the text so each distinct reason is said once. */
+	private String loggedMapClickRefusal = "";
+
+	/** Last "could not resolve a target" reason mentioned, deduplicated the same way. */
+	private String loggedSelectionFailure = "";
+
+	/** Why the most recent {@link #getSelectedWorldPoint} returned UNDEFINED; null when it resolved. */
+	private String selectionFailure = null;
+
+	/**
+	 * Records why a click could not be resolved, then answers UNDEFINED -- so a caller can tell a
+	 * FAILED resolve apart from the user asking to clear the target, which is the same int.
+	 */
+	private int failSelection(String why)
+	{
+		selectionFailure = why;
 		return WorldPointUtil.UNDEFINED;
+	}
+
+	private void noteMapRefusal(String message)
+	{
+		if (!message.equals(loggedMapClickRefusal))
+		{
+			loggedMapClickRefusal = message;
+			System.out.println("[shortestpath] " + message);
+		}
+	}
+
+	private void noteSelectionFailure(String what)
+	{
+		String message = what + ", so the current target is left alone: "
+			+ (selectionFailure == null ? "nothing was selected" : selectionFailure);
+		if (!message.equals(loggedSelectionFailure))
+		{
+			loggedSelectionFailure = message;
+			System.out.println("[shortestpath] " + message);
+		}
+	}
+
+	/**
+	 * Whether a right-click over the world map may offer the map-branch entries.
+	 *
+	 * <p>Defined as "the resolver would take the MAP branch for this click", by asking
+	 * {@link #selectionSourceFor} itself with the cursor's position. Not "the same containment test":
+	 * the SAME FUNCTION, so the menu cannot offer a row the resolver will refuse and cannot withhold
+	 * one it would have answered. These two were once decided differently, and that was a real defect
+	 * -- the menu asked {@code map.getBounds().contains(mouse)} against a parent-relative rectangle
+	 * while the resolver asked only "is the map open at all", so a shift-right-click anywhere on the
+	 * scene resolved through the map branch and set a target computed from a map pixel nobody had
+	 * clicked.</p>
+	 */
+	private boolean mouseIsOverUsableMap()
+	{
+		Widget map = client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER);
+		return selectionSourceFor(WorldMap.isOnScreen(map),
+			WorldMap.containmentRefusalFor(map),
+			pointIsOnMapSurface(map, client.getMouseCanvasPosition()),
+			WorldMap.inversionRefusalFor(map, client.getWorldMap()),
+			client.getTopLevelWorldView().getSelectedSceneTile() != null,
+			SCENE_UNDER_OPEN_MAP) == SelectionSource.MAP;
+	}
+
+	/**
+	 * Question (b) alone: is this canvas point on the map's surface? The rectangle is consulted only
+	 * after {@link WorldMap#containmentRefusalFor} has vouched for it AS A RECTANGLE, so
+	 * {@code contains} is meaningful rather than a test against a parent-relative rectangle that could
+	 * answer either way for the wrong reason.
+	 *
+	 * <p>Containment, not {@link WorldMap#refusalFor}. Asking the inversion question here would fold
+	 * the SCALE into "did the click land on the map", and a false answer there does not mean "the
+	 * click was elsewhere" -- it means "we could not tell". False from this method is only ever
+	 * consumed alongside the containment refusal that explains it: {@link #selectionSourceFor} reads
+	 * the refusal FIRST and never reaches the boolean when it is non-null.</p>
+	 */
+	private boolean pointIsOnMapSurface(Widget map, Point at)
+	{
+		if (at == null || WorldMap.containmentRefusalFor(map) != null)
+		{
+			return false;
+		}
+		return map.getBounds().contains(at.getX(), at.getY());
+	}
+
+	/**
+	 * "Set target" / "Set target N": resolve first, and only act if the resolve produced a tile.
+	 *
+	 * <p>{@link #setTarget(int)} with {@link WorldPointUtil#UNDEFINED} is not a no-op -- it reaches
+	 * {@link #setTargets} with an empty set, which cancels the pathfinder, nulls it, removes the world
+	 * map marker and clears {@code startPointSet}. So a FAILED resolve routed through it is
+	 * indistinguishable from the user pressing "Clear path", and the visible behaviour is a click on
+	 * "Set target" silently deleting the path that was already there. Splitting the two here is the
+	 * guard the caller side of the fix needed: a failure leaves the existing target exactly as it was
+	 * and says why (once per distinct reason), while the CLEAR menu row, the clear hotkey and the
+	 * PLUGIN_MESSAGE_CLEAR path keep calling {@code setTarget(UNDEFINED)} and keep clearing.</p>
+	 */
+	private void setTargetFromSelection(boolean append)
+	{
+		int selected = getSelectedWorldPoint();
+		if (selected == WorldPointUtil.UNDEFINED)
+		{
+			noteSelectionFailure("\"Set target\" could not be resolved to a tile");
+			return;
+		}
+		setTarget(selected, append);
 	}
 
 	private void setTarget(int target)
@@ -1433,6 +1801,26 @@ public class ShortestPathPlugin extends Plugin
 		return WorldPointUtil.dxdy(mapPoint, dx, dy);
 	}
 
+	/**
+	 * kewl: the forward map projection refuses at its own boundary, not just at its callers'.
+	 *
+	 * <p>Upstream's only guard is {@code map != null}, which is exactly the guard that is not enough
+	 * on this client: the world-map group stays loaded while the map is closed, and a component's
+	 * stored x/y is parent-relative until its chain resolves. Everything downstream of these two
+	 * methods -- the overlay's fills, the dashed transport lines, the collision-extent walk, and
+	 * {@link #calculateMapPoint}, which is these two run BACKWARDS to turn a click into a tile --
+	 * already treats {@code Integer.MIN_VALUE} as "no answer" and drops the point. So the honest place
+	 * to refuse is here, once, where the rectangle is actually read.</p>
+	 *
+	 * <p>That makes the wrong-target failure structurally impossible rather than merely gated: a
+	 * caller that forgets the predicate gets no coordinate instead of a plausible-looking one that is
+	 * a fixed vector away from the truth.</p>
+	 */
+	private boolean mapProjectionUsable(Widget map)
+	{
+		return WorldMap.refusalFor(map, client.getWorldMap()) == null;
+	}
+
 	public int mapWorldPointToGraphicsPointX(int packedWorldPoint)
 	{
 		WorldMap worldMap = client.getWorldMap();
@@ -1440,7 +1828,7 @@ public class ShortestPathPlugin extends Plugin
 		float pixelsPerTile = worldMap.getWorldMapZoom();
 
 		Widget map = client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER);
-		if (map != null)
+		if (mapProjectionUsable(map))
 		{
 			Rectangle worldMapRect = map.getBounds();
 
@@ -1466,7 +1854,7 @@ public class ShortestPathPlugin extends Plugin
 		float pixelsPerTile = worldMap.getWorldMapZoom();
 
 		Widget map = client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER);
-		if (map != null)
+		if (mapProjectionUsable(map))
 		{
 			Rectangle worldMapRect = map.getBounds();
 
@@ -1506,17 +1894,28 @@ public class ShortestPathPlugin extends Plugin
 			.onClick(this::onMenuOptionClicked);
 	}
 
+	/**
+	 * kewl: the shim's own resolver instead of upstream's three-way guess, and this is what makes the
+	 * minimap drawing FOLLOW THE MINIMAP -- the thing the user actually asked for.
+	 *
+	 * <p>Two differences, both of which the upstream form gets wrong on this client:</p>
+	 * <ul>
+	 *   <li>It picks the top-level interface by ASKING which one resolved, rather than by branching on
+	 *       {@code isResized()} and a varbit. All three of these widgets exist in the tree; only the
+	 *       built one has a rectangle, and choosing wrong hands back a stale or empty one.</li>
+	 *   <li>It returns null unless the rectangle is CANVAS-ABSOLUTE. Every consumer of this widget --
+	 *       {@link #getMinimapClipArea}, its simple fallback, {@code Perspective.localToMinimap} --
+	 *       uses the bounds as a clip or an origin, and a parent-relative rectangle is the failure
+	 *       that piled every minimap dot in the canvas's top-left corner.</li>
+	 * </ul>
+	 *
+	 * <p>Nothing here caches the rectangle: it is re-read every frame (the shim memoises the native
+	 * call per frame), so moving or resizing the interface moves the drawing with it on the next
+	 * frame, and {@link #getMinimapClipArea} already rebuilds its clip whenever the bounds change.</p>
+	 */
 	private Widget getMinimapDrawWidget()
 	{
-		if (client.isResized())
-		{
-			if (client.getVarbitValue(VarbitID.RESIZABLE_STONE_ARRANGEMENT) == 1)
-			{
-				return client.getWidget(InterfaceID.ToplevelPreEoc.MINIMAP);
-			}
-			return client.getWidget(InterfaceID.ToplevelOsrsStretch.MINIMAP);
-		}
-		return client.getWidget(InterfaceID.Toplevel.MINIMAP);
+		return client.getMinimapDrawWidget();
 	}
 
 	private Shape getMinimapClipAreaSimple()

@@ -63,7 +63,8 @@ public class PanelBridgeTest
 
 	private static final class Packed
 	{
-		int enabled, hasConfig, hotkey;
+		/** flags is the plugin record's FLAGS word: bit0 has settings, bit1 developer. */
+		int enabled, flags, hotkey;
 		String name, description, status;
 		final List<SettingRecord> settings = new ArrayList<>();
 	}
@@ -118,7 +119,9 @@ public class PanelBridgeTest
 		{
 			Packed p = new Packed();
 			p.enabled = r.u32();
-			p.hasConfig = r.u32();
+			p.flags = r.u32();
+			assertEquals("plugin flags " + p.flags + " carries a bit the layout does not document",
+					0, p.flags & ~(PanelBridge.PLUGIN_FLAG_CONFIG | PanelBridge.PLUGIN_FLAG_DEV));
 			p.hotkey = r.u32();
 			assertTrue("hotkey " + p.hotkey + " is outside the documented -1..7",
 					p.hotkey >= -1 && p.hotkey <= 7);
@@ -207,7 +210,15 @@ public class PanelBridgeTest
 			assertEquals("plugin " + i + " description", p.description(), packed.description);
 			assertEquals("plugin " + i + " status", p.status(), packed.status);
 			assertEquals("plugin " + i + " enabled", p.isEnabled() ? 1 : 0, packed.enabled);
-			assertEquals("plugin " + i + " hasConfig", p.config.isEmpty() ? 0 : 1, packed.hasConfig);
+			// bit0 is the field's original hasConfig, unchanged -- the developer bit rode into the
+			// spare bits of this same int rather than costing a FORMAT bump, so a dropped or shifted
+			// bit here shows up as a gear that stops opening rather than as a parse failure.
+			assertEquals("plugin " + i + " has-settings flag",
+					p.config.isEmpty() ? 0 : PanelBridge.PLUGIN_FLAG_CONFIG,
+					packed.flags & PanelBridge.PLUGIN_FLAG_CONFIG);
+			assertEquals("plugin " + i + " developer flag",
+					p.developer() ? PanelBridge.PLUGIN_FLAG_DEV : 0,
+					packed.flags & PanelBridge.PLUGIN_FLAG_DEV);
 			assertEquals("plugin " + i + " hotkey", p.hotkey(), packed.hotkey);
 
 			// Every declared setting is there, in declaration order, with the kind the panel draws.
@@ -224,7 +235,87 @@ public class PanelBridgeTest
 						documentedKind(p, s), rec.kind);
 				assertEquals("plugin " + p.name() + "/" + s.key() + " min", s.min(), rec.min);
 				assertEquals("plugin " + p.name() + "/" + s.key() + " max", s.max(), rec.max);
+				// flags bit2 is the secret marker, and it is the only thing that separates a password
+				// field from a text field on the launcher's side -- a dropped bit draws the password.
+				assertEquals("plugin " + p.name() + "/" + s.key() + " secret flag",
+						s.secret() ? PanelBridge.FLAG_SECRET : 0, rec.flags & PanelBridge.FLAG_SECRET);
+				assertEquals("plugin " + p.name() + "/" + s.key() + " keybind flag",
+						kewl.ui.RlConfigMeta.of(p).isKeybind(s.key()) ? 1 : 0, rec.flags & 1);
 			}
+		}
+	}
+
+	@Test
+	public void theDeveloperScaffoldingIsMarkedAndNothingElseIs()
+	{
+		// The four the panel groups under "Developer": two shim smoke tests, and the two kewl box
+		// drawers the RuneLite ports (NPC Indicators / Player Indicators) replaced as the real
+		// visuals. They are marked, not deleted -- so the model must still carry every one of them,
+		// with the bit set, and the plugins someone actually runs must NOT have it.
+		Model m = decode(PanelBridge.snapshot());
+		List<String> developer = List.of("Test Rlite", "Test Actors", "NPC visuals", "Player visuals");
+		for (String name : developer)
+		{
+			Packed packed = m.byName(name);
+			assertTrue("the registry no longer carries \"" + name + "\"", packed != null);
+			assertEquals(name + " must be marked developer scaffolding",
+					PanelBridge.PLUGIN_FLAG_DEV, packed.flags & PanelBridge.PLUGIN_FLAG_DEV);
+		}
+		for (Packed packed : m.plugins)
+		{
+			if (developer.contains(packed.name)) continue;
+			assertEquals(packed.name + " is not developer scaffolding and must not be flagged as it",
+					0, packed.flags & PanelBridge.PLUGIN_FLAG_DEV);
+		}
+		// The mark is a grouping, not a deletion: the record count still matches the registry, so the
+		// launcher's positional edit indices are untouched by it.
+		assertEquals("the developer mark must not change the record count",
+				KewlKlient.plugins().size(), m.plugins.size());
+		assertTrue("every plugin cannot be developer scaffolding",
+				m.plugins.size() > developer.size());
+	}
+
+	@Test
+	public void secretTextSettingsCarryTheFlagAndStillTheValue()
+	{
+		// The real registry carries one: AutoLogin's password. It must arrive as kind 5 (text) with
+		// bit2 set, and with its value in valueText -- masking is the launcher's job, and a bridge
+		// that blanked the value would leave the field unable to round-trip an edit.
+		Setting secret = null;
+		for (Plugin p : KewlKlient.plugins())
+		{
+			for (Setting s : p.config.all()) if (s.secret()) secret = s;
+		}
+		assertTrue("no secret setting in the registry -- AutoLogin should declare its password as one",
+				secret != null);
+		assertEquals(Setting.Kind.TEXT, secret.kind());
+		Object was = secret.value();
+		try
+		{
+			secret.set("bridge-test-value");
+			Model m = decode(PanelBridge.snapshot());
+			Packed owner = m.byName(pluginOf(secret).name());
+			SettingRecord rec = null;
+			for (SettingRecord r : owner.settings) if (r.key.equals(secret.key())) rec = r;
+			assertTrue(rec != null);
+			assertEquals(5, rec.kind);
+			assertEquals(PanelBridge.FLAG_SECRET, rec.flags & PanelBridge.FLAG_SECRET);
+			assertEquals("bridge-test-value", rec.valueText);
+			// And nothing a non-secret text setting carries has the bit.
+			for (Packed p : m.plugins)
+			{
+				for (SettingRecord r : p.settings)
+				{
+					if (r.kind == 5 && !(p == owner && r.key.equals(secret.key())))
+						assertEquals(p.name + "/" + r.key + " must not be flagged secret",
+								0, r.flags & PanelBridge.FLAG_SECRET);
+				}
+			}
+		}
+		finally
+		{
+			secret.set(was);
+			Plugin.drainLater();
 		}
 	}
 

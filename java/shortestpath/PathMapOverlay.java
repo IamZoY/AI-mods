@@ -13,6 +13,7 @@ import net.runelite.api.Client;
 import net.runelite.api.Point;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
+import net.runelite.api.worldmap.WorldMap;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
@@ -43,6 +44,40 @@ public class PathMapOverlay extends Overlay
 		drawAfterLayer(InterfaceID.Worldmap.MAP_CONTAINER);
 	}
 
+	private static String loggedMapRefusal = "";
+
+	/**
+	 * Whether the shim can describe the world map well enough to draw on it -- ONE predicate, shared
+	 * with {@code ShortestPathPlugin}'s map-click path and its menu entries, so the three cannot
+	 * disagree about whether the map is usable (they did, and that disagreement is half of the
+	 * "a map click flies to another area" report).
+	 *
+	 * <p>This used to be a hardcoded {@code false}. It was right to be: with a parent-relative
+	 * rectangle AND a placeholder scale, this overlay clipped and filled the wrong region and the map
+	 * rendered FULLY BLACK with its close button unusable (live 2026-09-06, proven by bisection).
+	 * What has changed is that both failures are now DETECTED rather than assumed: the widget reports
+	 * whether its rectangle is canvas-absolute, and the scale reports whether it was measured. So the
+	 * refusal lifts by itself the moment the geometry is real, and re-arms by itself if it stops being
+	 * -- and when it refuses it says WHICH of the five conditions failed, because the fixes differ.</p>
+	 */
+	private boolean worldMapGeometryTrusted(Widget map)
+	{
+		String refusal = WorldMap.refusalFor(map, client.getWorldMap());
+		if (refusal == null)
+		{
+			return true;
+		}
+		// Keyed on the TEXT, so each distinct reason is said once and a changed reason is said again
+		// (a session can move from "not loaded" to "closed" to "no scale"), without a line per frame.
+		if (!refusal.equals(loggedMapRefusal))
+		{
+			loggedMapRefusal = refusal;
+			System.out.println("[shortestpath] world map overlay stays OFF: " + refusal
+					+ ". Path tiles, the minimap and the scene overlays are unaffected.");
+		}
+		return false;
+	}
+
 	@Override
 	public Dimension render(Graphics2D graphics)
 	{
@@ -51,12 +86,19 @@ public class PathMapOverlay extends Overlay
 			return null;
 		}
 
-		if (client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER) == null)
+		Widget mapContainer = client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER);
+
+		// kewl: DO NOT DRAW while the shim cannot describe the map. Painting over the game's own map is
+		// far worse than drawing no path on it -- see worldMapGeometryTrusted for what that looked like
+		// -- so the honest behaviour is to stand down and say why. Note this is also the isHidden()
+		// gate: on this build the world-map GROUP STAYS LOADED WHILE THE MAP IS CLOSED, so the upstream
+		// null check alone let this overlay run with the map shut and paint over the scene.
+		if (!worldMapGeometryTrusted(mapContainer))
 		{
 			return null;
 		}
 
-		Rectangle worldMapRectangle = Objects.requireNonNull(client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER)).getBounds();
+		Rectangle worldMapRectangle = Objects.requireNonNull(mapContainer).getBounds();
 		Area worldMapClipArea = getWorldMapClipArea(worldMapRectangle);
 		graphics.setClip(worldMapClipArea);
 
@@ -196,12 +238,17 @@ public class PathMapOverlay extends Overlay
 
 		Area clipArea = new Area(baseRectangle);
 
-		if (overview != null && !overview.isHidden())
+		// kewl: the same absoluteness gate the container passes. These two are SUBTRACTED from the
+		// clip, so a parent-relative rectangle here does not merely fail to protect the overview panel
+		// -- it punches a hole out of the path somewhere else on the map. Skipping the subtraction
+		// draws path over the overview panel, which is cosmetic; subtracting the wrong rectangle is
+		// not, so the failure is taken in the cosmetic direction.
+		if (overview != null && !overview.isHidden() && overview.isCanvasAbsolute())
 		{
 			clipArea.subtract(new Area(overview.getBounds()));
 		}
 
-		if (surfaceSelector != null && !surfaceSelector.isHidden())
+		if (surfaceSelector != null && !surfaceSelector.isHidden() && surfaceSelector.isCanvasAbsolute())
 		{
 			clipArea.subtract(new Area(surfaceSelector.getBounds()));
 		}

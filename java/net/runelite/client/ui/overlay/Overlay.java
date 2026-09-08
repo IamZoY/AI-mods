@@ -4,6 +4,7 @@ package net.runelite.client.ui.overlay;
 
 import java.awt.Dimension;
 import java.awt.Graphics2D;
+import java.awt.Rectangle;
 
 public abstract class Overlay implements RenderableEntity
 {
@@ -19,8 +20,21 @@ public abstract class Overlay implements RenderableEntity
 	private Dimension preferredSize;
 	private boolean resizable;
 
+	// The rectangle this overlay occupied when it was last rendered. Upstream RuneLite has the same
+	// field for the same reason: an overlay pinned to a RIGHT or BOTTOM corner has to be moved by its
+	// own width/height before it is drawn, and its height is not known until it has been drawn. A
+	// measuring pre-pass is impossible at this level -- OverlayPanel.render() empties its panel's
+	// child list on the way out, so a second render in the same frame draws an empty panel -- so the
+	// renderer places from the size recorded here on the PREVIOUS frame, exactly as upstream does.
+	private final Rectangle bounds = new Rectangle();
+
 	protected Overlay()
 	{
+	}
+
+	public Rectangle getBounds()
+	{
+		return bounds;
 	}
 
 	public OverlayPosition getPosition()

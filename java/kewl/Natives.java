@@ -20,8 +20,10 @@ public final class Natives {
     public static native boolean ready();
 
     /**
-     * Every visible entity, seven ints each, flattened:
-     * {@code uid, sceneX, sceneY, isPlayer, id, animation, orientation}.
+     * Every visible entity, ten ints each, flattened (nEntities in client/jvm.hpp):
+     * {@code uid, sceneX, sceneY, isPlayer, id, animation, orientation, fineX, fineH, fineY} --
+     * the last three are the rendered position in fine units (128/tile) and the ground height under
+     * it (client height axis, negative = up), live on client-240-6.
      *
      * <p>{@code id} is the NPC type for NPCs. For players it is always {@code -1} on this build: the
      * combat-level offset we had is wrong on client-240-6 (it read pointer garbage, not a level) and
@@ -49,7 +51,17 @@ public final class Natives {
      */
     public static native int[] container(int containerId);
 
-    /** You: {@code {uid, sceneX, sceneY, plane, animation, orientation, runEnergy, cycle}}, or empty. */
+    /**
+     * You: ELEVEN ints, {@code {uid, sceneX, sceneY, plane, animation, orientation, runEnergy, cycle,
+     * fineX, fineH, fineY}}, or empty when you have not spawned. The last three are the render position
+     * and ground height, exactly as in {@link #entities} (fine units, 128/tile, height negative = up).
+     *
+     * <p>This javadoc said "eight" until review 2026-09-06 while nLocal had returned eleven since the
+     * render position landed. {@code Local.read()} rejects any other length outright, so a contributor
+     * who added a field to the layout the old doc described would have got {@code Local.ABSENT}
+     * forever -- {@code Game.ready()} false and every plugin silently dead. Both sides move together:
+     * nLocal in {@code client/jvm.hpp}, {@code Local.read()}, and this line.</p>
+     */
     public static native int[] local();
 
     /** All 25 skills: {@code effective[25]}, then {@code base[25]}, then {@code xp[25]}. */
@@ -121,11 +133,13 @@ public final class Natives {
     public static native int gameState();
 
     /**
-     * An entity's name by uid -- players off entity+0x718, NPCs off their definition's +0x8.
-     * Empty when it despawned or the name could not be read. Names may contain U+00A0 where the
-     * game pads; callers that compare against typed text should fold that to a space.
+     * An entity's name by uid AND kind -- players off entity+0x718, NPCs off their definition's
+     * +0x8. {@code player} is required because players and NPCs live in two separate client tables
+     * with separate uid keyspaces, so the uid alone does not identify an entity. Empty when it
+     * despawned or the name could not be read. Names may contain U+00A0 where the game pads;
+     * callers that compare against typed text should fold that to a space.
      */
-    public static native String entityName(int uid);
+    public static native String entityName(int uid, boolean player);
 
     /**
      * One widget's state by its client id ({@code (group << 16) | component}):
@@ -144,6 +158,52 @@ public final class Natives {
     public static native int[] widgetChild(int id, int childIndex);
 
     /**
+     * One widget's rectangle in CANVAS coordinates:
+     * {@code {ok, absX, absY, width, height, hidden, depth, complete}}, or empty when the id is not
+     * loaded. This is RuneLite's {@code getCanvasLocation} -- the component's own x/y plus every
+     * ancestor's -- taken in C++ because each ancestor is three guarded derefs there and one JNI round
+     * trip here, and {@code Perspective.localToMinimap} asks for the minimap rectangle per drawn point.
+     *
+     * <p>{@code complete} is the field a caller must branch on. It is 1 only when the parent chain was
+     * walked all the way to a root, which is the only case where absX/absY are a canvas position. When
+     * it is 0 the pair is the stored PARENT-RELATIVE x/y -- byte-identical to {@link #widget} -- and
+     * the caller must refuse rather than draw at it. The chain is walked through a parent link that is
+     * DERIVED AT RUNTIME rather than hardcoded (client/game.hpp {@code scanWidgetTree}, specified in
+     * the "THE PARENT LINK" block of client/offsets.hpp): the derivation only accepts an offset that
+     * holds for every component of every loaded group, and refuses outright when two survive, so
+     * {@code complete == 0} is what an undecided derivation looks like from here.</p>
+     *
+     * <p>NOT subtracted: an ancestor's scroll offset, which upstream does subtract and which no offset
+     * on this build exposes. Neither map has a scrolling ancestor; a row inside a scrolled list comes
+     * back off by the scroll amount.</p>
+     */
+    public static native int[] widgetAbs(int id);
+
+    /**
+     * The parent chain behind one {@link #widgetAbs} answer as a single human-checkable line, e.g.
+     * {@code "161:30 (53,8) 152x152 <- 161:22 (1090,4) 224x160 <- 161:0 (0,0) 1314x900 => abs
+     * (1143,12) 152x152 via parentId, depth 2, complete"}.
+     *
+     * <p>Diagnostic: once a session under {@code KEWL_LOG}, never per frame. The LAST hop is a
+     * self-test that needs no measurement by eye -- a group root must come out {@code (0,0)} at
+     * exactly the canvas size, and if it does not then the stored x/y are cache originals rather than
+     * the laid-out rectangle and the whole absolute-geometry approach is the wrong one.</p>
+     */
+    public static native String widgetChain(int id);
+
+    /**
+     * Re-derive the widget parent link from scratch and return the tally: which offset carries
+     * {@code (group << 16) | component} on every component (the positive control), which carries a
+     * same-group parent id or parent pointer, how many candidates survived an acyclic-forest check,
+     * and whether {@code IFTYPE_CHILDREN_*} carries the static tree or only runtime children.
+     *
+     * <p>This is the EVIDENCE behind every absolute rectangle in the shim, printed with counts rather
+     * than a verdict so a near miss is visible. Walks every loaded component's first 0x400 bytes
+     * twice: call it from a probe, at most once a session, never per frame.</p>
+     */
+    public static native String widgetTreeProbe();
+
+    /**
      * The world map's state: {@code {level, originX, originZ, centreX, centreZ}}, or empty before the
      * map object exists. The origin is the map's coordinate base in world tiles; the centre ints are
      * the map centre in 8-tile units (centre tile = {@code 8 * centre = origin + 48}), passed through
@@ -155,4 +215,109 @@ public final class Natives {
 
     /** Ids of every widget group whose component data is currently loaded, ascending. */
     public static native int[] loadedGroups();
+
+    /**
+     * Addresses whose bytes equal {@code needle} in this process's read/write memory, at most 64.
+     *
+     * <p>Diagnosis, not a feature: it is how the login form's username field was located without a
+     * decompiler. It returns ADDRESSES ONLY, never the bytes, so a caller may pass a secret and log
+     * what comes back. A needle under three characters is refused (it would match everywhere).</p>
+     */
+    public static native long[] findString(String needle);
+
+    /** {@code len} bytes at {@code at} as hex, or "" when the address is not readable. Diagnosis. */
+    public static native String peek(long at, int len);
+
+    /**
+     * Every loaded interface component that carries text, one per line:
+     * {@code "group:component x,y wxh shown|hidden text"}, at most {@code max} lines.
+     *
+     * <p>How a plugin finds a button by its LABEL rather than by a coordinate somebody measured once:
+     * "CLICK HERE TO PLAY" is a component, and its id is stable where a pixel offset is not. Walks the
+     * whole interface tree, so call it from a probe or an explicit action, never per frame.</p>
+     */
+    public static native String dumpWidgetText(int max);
+
+    /**
+     * Offsets within the client object whose pointer lands within {@code slack} bytes before
+     * {@code target}, searching the first {@code span} bytes. At most 64.
+     *
+     * <p>The discriminator a value scan cannot give: a string the game renders is reachable from the
+     * client object, while an identical copy in the JVM heap is not. A hit says "this buffer belongs to
+     * a client structure, at this offset" -- which is what goes in {@code client/offsets.hpp}.</p>
+     */
+    public static native int[] pointersTo(long target, int span, int slack);
+
+    /**
+     * Offsets at which loaded interface components hold the pair {@code (w, h)}, one
+     * {@code "group:component w@+HEX h@+HEX"} per line.
+     *
+     * <p>Pass the canvas size: a top-level interface is canvas-sized, so the offsets that come back are
+     * where components really keep their rectangle. {@code IFTYPE_WIDTH}/{@code IFTYPE_HEIGHT} in
+     * {@code client/offsets.hpp} read 1 for every component on client-240-6, which is why every widget
+     * position in the shim is wrong; this is how the right ones get derived without a decompiler.</p>
+     */
+    public static native String findWidgetRect(int w, int h);
+
+    /**
+     * Write one NUL-terminated login field at an address {@link #findString} produced. The ONLY write
+     * into game memory in the whole client, and it is guarded like one.
+     *
+     * <p>It refuses -- writing nothing -- unless every one of these holds: the address is readable;
+     * the region is committed and {@code PAGE_READWRITE} (no {@code VirtualProtect}, ever: a target
+     * that is not already writable is a target we got wrong); the {@code cap} bytes there hold either
+     * all zeroes or exactly {@code value}; the value fits in the existing content plus the run of
+     * zeroes after it, and within {@code cap}; and the buffer is not shaped like an inline NxtString,
+     * whose length byte this will not guess at. It never logs the value.</p>
+     *
+     * @param cap the most bytes of the buffer that may be touched, terminator included; 1..256
+     * @return 0 written, or a negative refusal code -- {@code -1} bad argument, {@code -2} not
+     *     readable, {@code -3} not writable, {@code -4} the buffer holds something unexpected,
+     *     {@code -5} no room, {@code -6} an inline NxtString. {@code kewl.plugins.autologin.FieldWriter}
+     *     mirrors these and turns them into words.
+     */
+    public static native int setLoginField(long addr, String value, int cap);
+
+    // -- input INTO the game (2026-09-05, not yet exercised live). All four are PostMessageW to NXT's
+    //    JagRenderView child and nothing else -- never SendInput, which would type into whatever
+    //    application is in front. See the "Input INTO the game" section of client/jvm.hpp for the
+    //    reasoning; plugins use kewl.api.Input, not these.
+
+    /**
+     * Post one UTF-16 code unit to the game as WM_CHAR. Text only -- never a WM_KEYDOWN, because the
+     * game's own TranslateMessage would derive the case from the physical shift state and emit a
+     * second WM_CHAR. Never logs the character: this is the password path.
+     *
+     * @return false when there is no game window to post to (or the post itself failed)
+     */
+    public static native boolean postChar(int codeUnit);
+
+    /**
+     * Post WM_KEYDOWN ({@code down=true}) or WM_KEYUP for a Win32 virtual key -- 0x09 Tab, 0x08
+     * Backspace, 0x0D Enter, 0x1B Escape. Not for letters (see {@link #postChar}).
+     *
+     * <p>Tab and Backspace go as the bare key pair: NXT's own TranslateMessage supplies their WM_CHAR,
+     * and a second one from us would Tab twice. Enter and Escape do NOT behave that way (live
+     * 2026-09-05 the login form never submitted with both fields typed), so nPostKey posts the WM_CHAR
+     * for those two itself -- {@code '\r'} / {@code 0x1B} -- between the down and the up. So a
+     * {@code postKey(VK_RETURN, true)} is a keydown AND a char, and "Enter arrives twice" is a
+     * question for the DLL, not for the game: this javadoc claimed the opposite until review
+     * 2026-09-06 and would have sent that hunt the wrong way.</p>
+     */
+    public static native boolean postKey(int vk, boolean down);
+
+    /**
+     * Mouse in canvas coordinates (the same space {@link #input} and {@link #viewport} report):
+     * action 0 move, 1 left down, 2 left up. Posted clicks ARE honoured on client-240-6: the autologin
+     * plugin's "Login" and "Click here to play" clicks are both posted through here and both work
+     * (seen live 2026-09-06). The client importing GetAsyncKeyState was the reason to doubt it.
+     */
+    public static native boolean postMouse(int x, int y, int action);
+
+    /**
+     * Diagnosis of where injected input goes: {@code {targetExists, targetIsRenderView,
+     * focusIsTarget, gameIsForeground, canvasW, canvasH}}. {@code grab=true} also SetFocus()es the
+     * game first, guarded by a 50 ms "is it pumping" probe so it cannot hang the frame thread.
+     */
+    public static native int[] inputTarget(boolean grab);
 }

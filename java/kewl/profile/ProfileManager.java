@@ -348,12 +348,20 @@ public final class ProfileManager implements Setting.Sink, PluginManager.Listene
             ProfileState s = state(activeId);
             if (s == null) return;
 
+            // Settings FIRST, then the switch (review 2026-09-06). onEnable is where a plugin reads
+            // its config -- AutoLogin resolves its credential source there, the RlitePlugin adapters
+            // call the port's startUp() -- so enabling before the stored values are in place ran that
+            // once on the code defaults and only then delivered the profile's values as changes. The
+            // startup log said "credentials: file, missing" for a profile that carries panel
+            // credentials. The listener semantics are unchanged: applySettings still fires the same
+            // per-key changes, they just land before the plugin is running rather than after.
+            applySettings(p, s);
+
             Boolean on = s.enabled.get(p.id());
             if (on != null) {
                 PluginManager mgr = PluginManager.instance();
                 if (mgr != null) mgr.setEnabled(p, on);
             }
-            applySettings(p, s);
         }
     }
 
@@ -412,8 +420,12 @@ public final class ProfileManager implements Setting.Sink, PluginManager.Listene
             // Silent about the plugin means off: see "a profile is a complete statement" above.
             Boolean on = s == null ? null : s.enabled.get(p.id());
             if (on == null) on = Boolean.FALSE;
-            if (on != p.isEnabled()) mgr.setEnabled(p, on);
+            // Settings before the switch, same reason as onRegistered above (review 2026-09-06): a
+            // plugin being turned ON by this profile switch must see the profile's values in its
+            // onEnable, not the code defaults it would then be corrected away from. Harmless for a
+            // plugin being turned off or left alone -- the two calls are independent.
             applySettings(p, s);
+            if (on != p.isEnabled()) mgr.setEnabled(p, on);
         }
     }
 

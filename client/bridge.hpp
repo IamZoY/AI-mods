@@ -79,13 +79,18 @@
 //
 //     [v1] int32 pluginCount                                    (cap MAX_PLUGINS)
 //          per plugin:
-//            int32 enabled, hasConfig, hotkey(-1..7)
+//            int32 enabled, flags, hotkey(-1..7)
+//                  (flags: bit0 = the plugin has settings -- this int used to BE "hasConfig 0/1"
+//                   and bit0 still is exactly that; bit1 = developer scaffolding, which the panel
+//                   sorts last under a "Developer" heading. PLUGIN_FLAG_* below. The developer bit
+//                   fits in the spare bits of a field that was already here, which is why format 2
+//                   did not have to become format 3.)
 //            char name[64], desc[160], status[160]
 //            int32 settingCount                                  (cap MAX_SETTINGS_PER_PLUGIN)
 //            per setting:
 //              int32 kind (0=bool, 1=int, 2=enum, 3=keybind, 4=color, 5=text),
 //                    valueInt, min, max, enumIndex, optionCount, flags
-//                    (flags: bit0=keybind, bit1=hasUnits)
+//                    (flags: bit0=keybind, bit1=hasUnits, bit2=secret -- SETTING_FLAG_* below)
 //              char key[64], label[96], desc[192], section[64], valueText[64]
 //              optionCount (max MAX_OPTIONS) x char option[48]
 //     [v2] int32 pinned[pluginCount]          0 or 1 each, index-parallel to the plugin records
@@ -170,6 +175,21 @@ enum EditKind : std::int32_t {
     EDIT_PROFILE_RENAME    = 13,     // intVal = index, text = new name
     EDIT_PROFILE_DUPLICATE = 14,     // intVal = profile index
 };
+
+// Plugin flags (the int32 that follows `enabled` in each plugin record). CONFIG is the field's
+// original "hasConfig 0/1" meaning, kept in bit0 so the field's old readers are still right; DEV is
+// kewl.Plugin.developer() -- test rigs and worked examples the panel groups under a "Developer"
+// heading, sorted after everything else. Mirrored in launcher/bridge_layout.hpp and as
+// PLUGIN_FLAG_CONFIG / PLUGIN_FLAG_DEV in kewl.panel.PanelBridge.
+constexpr std::int32_t PLUGIN_FLAG_CONFIG = 1 << 0;
+constexpr std::int32_t PLUGIN_FLAG_DEV    = 1 << 1;
+
+// Setting flags (int32 flags per setting record, per the layout comment). SECRET marks a text
+// setting whose value the launcher edits in a password field and never draws in clear -- the value
+// itself still travels in valueText, unmasked, because the field has to be able to edit it.
+constexpr std::int32_t SETTING_FLAG_KEYBIND  = 1 << 0;
+constexpr std::int32_t SETTING_FLAG_HASUNITS = 1 << 1;
+constexpr std::int32_t SETTING_FLAG_SECRET   = 1 << 2;
 
 // Hub entry flags (int32 flags per hub record, per the layout comment).
 constexpr std::int32_t HUB_FLAG_INSTALLED  = 1 << 0;
@@ -339,14 +359,14 @@ inline bool buildModel(std::vector<std::uint8_t>& out, const std::vector<jint>& 
 
     for (std::int32_t i = 0; i < pluginCount; ++i) {
         std::int32_t enabled = r.i32();
-        std::int32_t hasCfg  = r.i32();
+        std::int32_t flags   = r.i32();   // PLUGIN_FLAG_*: bit0 has settings, bit1 developer
         std::int32_t hotkey  = r.i32();
         std::string  name    = r.str();
         std::string  desc    = r.str();
         std::string  status  = r.str();
         if (!r.ok) return false;
         putI32(out, enabled);
-        putI32(out, hasCfg);
+        putI32(out, flags);
         putI32(out, hotkey);
         putField(out, name,   model::PLUGIN_NAME);
         putField(out, desc,   model::PLUGIN_DESC);
@@ -450,7 +470,10 @@ inline UINT  g_msgEditNotify = 0;   // registered: launcher -> dllMsgHwnd after 
 // the strip. ADDITIVE on purpose -- this proc ignores it, matching today's behaviour where focus is
 // already held by the attached input queues; a mode that needs it can read the flag later.
 inline bool  g_editsPending  = false;
-inline long  g_publishedRevision = -1;
+// int64, not long: Java's revision is a long and `long` is 32 bits in this toolchain, so a revision
+// past 2^31 truncated on the way in here and never compared equal again -- a full snapshot rebuilt
+// and republished on every retry tick for the rest of the session (review 2026-09-06).
+inline std::int64_t g_publishedRevision = -1;
 inline bool  g_publishedEmpty = false;
 inline bool  g_bridgeLogged   = false;
 // Set when a snapshot was rejected and cleared when one publishes: tick() uses it to say "recovered"
@@ -474,9 +497,13 @@ inline Server g_srv;
 /// The bridge window's proc. It exists for one message; everything else is DefWindowProc. The edit
 /// notification only sets a flag -- the drain happens on the tick loop, under JNI, and doing JNI work
 /// inside a window proc on a message the launcher just posted would serialise the launcher against us.
-inline LRESULT CALLBACK msgProc(HWND h, UINT m, WPARAM, LPARAM) {
+inline LRESULT CALLBACK msgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == g_msgEditNotify && g_msgEditNotify) { g_editsPending = true; return 0; }
-    return DefWindowProcW(h, m, 0, 0);
+    // The real w/l, not zeros: DefWindowProc answers WM_NCCREATE from lParam's CREATESTRUCT, and a
+    // null one makes it return FALSE -- which is CreateWindowExW failing with GetLastError() == 0,
+    // exactly the "no message window (both ... failed, GetLastError=0)" line seen live on Windows
+    // 2026-09-05. Edits still drained on the tick loop; only the notify latency was lost.
+    return DefWindowProcW(h, m, w, l);
 }
 
 /// Create the mapping, the mutex and the hidden window, and fill in the header's window handles.
@@ -485,13 +512,18 @@ inline LRESULT CALLBACK msgProc(HWND h, UINT m, WPARAM, LPARAM) {
 /// launcher mode then runs with an empty panel rather than a crashed game.
 inline void stop();
 inline bool start(HMODULE module, HWND launcherHwnd) {
-    wchar_t name[128];
-    swprintf(name, 128, L"Local\\KewlKlientBridge-%lu", static_cast<unsigned long>(GetCurrentProcessId()));
+    // std::wstring, NOT swprintf: mingw-w64's C++ mode routes swprintf through its own C99 formatter,
+    // where a wide format's "%s" means a NARROW string -- so the old `swprintf(L"%s-mtx", name)`
+    // read the wide name as bytes and produced the mutex "Local\L-mtx". The mapping existed, its
+    // mutex did not, and the launcher (which requires both) sat on "waiting for the DLL bridge"
+    // forever. Seen live on Windows 2026-09-05, invisible under the llvm-mingw Wine build.
+    const std::wstring name = L"Local\\KewlKlientBridge-" + std::to_wstring(GetCurrentProcessId());
+    const std::wstring mtxName = name + L"-mtx";
 
     g_srv.mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
-                                       static_cast<DWORD>(MAPPING_BYTES), name);
+                                       static_cast<DWORD>(MAPPING_BYTES), name.c_str());
     if (!g_srv.mapping) {
-        std::printf("[bridge] CreateFileMappingW failed (GetLastError=%lu)\n",
+        kk::logf("[bridge] CreateFileMappingW failed (GetLastError=%lu)\n",
                     static_cast<unsigned long>(GetLastError()));
         std::fflush(stdout);
         return false;
@@ -501,7 +533,7 @@ inline bool start(HMODULE module, HWND launcherHwnd) {
 
     g_srv.hdr = static_cast<Header*>(MapViewOfFile(g_srv.mapping, FILE_MAP_ALL_ACCESS, 0, 0, MAPPING_BYTES));
     if (!g_srv.hdr) {
-        std::printf("[bridge] MapViewOfFile failed (GetLastError=%lu)\n",
+        kk::logf("[bridge] MapViewOfFile failed (GetLastError=%lu)\n",
                     static_cast<unsigned long>(GetLastError()));
         std::fflush(stdout);
         stop();
@@ -515,11 +547,9 @@ inline bool start(HMODULE module, HWND launcherHwnd) {
     g_srv.hdr->version      = BRIDGE_VERSION;
     g_srv.hdr->launcherHwnd = reinterpret_cast<std::uint64_t>(launcherHwnd);
 
-    wchar_t mtxName[160];
-    swprintf(mtxName, 160, L"%s-mtx", name);
-    g_srv.mutex = CreateMutexW(nullptr, FALSE, mtxName);
+    g_srv.mutex = CreateMutexW(nullptr, FALSE, mtxName.c_str());
     if (!g_srv.mutex) {
-        std::printf("[bridge] CreateMutexW failed (GetLastError=%lu)\n",
+        kk::logf("[bridge] CreateMutexW failed (GetLastError=%lu)\n",
                     static_cast<unsigned long>(GetLastError()));
         std::fflush(stdout);
         stop();
@@ -544,7 +574,7 @@ inline bool start(HMODULE module, HWND launcherHwnd) {
         g_srv.msgWnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0,
                                        nullptr, nullptr, module, nullptr);
     if (!g_srv.msgWnd) {
-        std::printf("[bridge] no message window (both HWND_MESSAGE and hidden fallback failed, GetLastError=%lu)"
+        kk::logf("[bridge] no message window (both HWND_MESSAGE and hidden fallback failed, GetLastError=%lu)"
                     " -- edits drain on the tick loop, the notify is just latency\n",
                     static_cast<unsigned long>(GetLastError()));
         std::fflush(stdout);
@@ -577,7 +607,7 @@ inline bool publishModel(std::int64_t revision) {
         // truncated v2 tail reads as a format mismatch but is Java's bug, not the jar's vintage.
         if (!g_bridgeLogged) {
             g_bridgeLogged = true;
-            std::printf("[bridge] snapshot rejected (%zu ints) -- keeping the last good model; "
+            kk::logf("[bridge] snapshot rejected (%zu ints) -- keeping the last good model; "
                         "retrying while Java's revision stays ahead\n", snap.size());
             std::fflush(stdout);
         }
@@ -626,7 +656,7 @@ inline void publishEmptyOnce() {
     ReleaseMutex(g_srv.mutex);
     if (!g_bridgeLogged) {
         g_bridgeLogged = true;
-        std::printf("[bridge] kewl/panel/PanelBridge not found -- panel model stays empty\n");
+        kk::logf("[bridge] kewl/panel/PanelBridge not found -- panel model stays empty\n");
         std::fflush(stdout);
     }
 }
@@ -639,13 +669,19 @@ inline bool applyEdit(const EditRecord& r) {
     char text[129] = {};  // that is, then hand Java a well-formed string
     std::memcpy(key, r.key, sizeof r.key);
     std::memcpy(text, r.text, sizeof r.text);
-    return kk::bridgeApply(r.kind, r.pluginIdx, key, r.intVal, text);
+    bool ok = kk::bridgeApply(r.kind, r.pluginIdx, key, r.intVal, text);
+    // text may be a password on its way to Setting.set: do not leave a copy of it on this thread's
+    // stack for the next frame to reuse or a crash dump to capture (review 2026-09-06).
+    SecureZeroMemory(text, sizeof text);
+    return ok;
 }
 
 /// Take every record the launcher has published and land each one in Java. The tail advances only
 /// after a record is consumed, so a crash between the JNI call and the bump replays that one edit --
 /// the same at-least-once choice every queue makes, and the safe one here (a dropped edit is a
-/// settings change the user never sees).
+/// settings change the user never sees). The one seam: a crash between the slot wipe below and the
+/// bump replays a zeroed record, which Java rejects as an empty key -- a strictly better outcome than
+/// leaving a consumed password in shared memory to avoid it.
 inline void drainEdits() {
     if (!g_srv.hdr) return;
     std::int32_t head = g_srv.hdr->head;
@@ -653,24 +689,37 @@ inline void drainEdits() {
     if (head <= tail) { g_editsPending = false; return; }
 
     if (head - tail >= RING_SLOTS) {
-        // The launcher lapped us (we stalled for seconds). At head - tail == RING_SLOTS every slot
-        // holds a record we never read, and the launcher's NEXT write targets slot head % 64 -- which
-        // is exactly where record `tail` still lives, so reading it would mean copying a 208-byte
-        // struct the launcher is concurrently overwriting, half of one edit and half of the next.
-        // `>=` is therefore not pedantry: `>` leaves exactly the one-slot window the guard exists to
-        // close. The honest response is to drop the whole backlog -- the launcher's next publish of
-        // the model re-syncs what the panel shows, and chasing 64 stale edits would replay old values
-        // over new ones. The launcher refuses to write into a full ring for the same reason, so this
-        // branch is the backstop, not the routine path.
+        // THE INVARIANT: the launcher never lets head - tail exceed RING_SLOTS - 1 (writeEdit refuses
+        // at that point), so a FULL ring is 63 pending records and every one of them is drained
+        // normally by the loop below. Reaching RING_SLOTS here therefore means the producer broke the
+        // contract, not that the user dragged a slider through a stall -- which is exactly what this
+        // guard used to punish: the launcher filled to 64, this branch called it lapped, and all 64
+        // edits (the final slider value included) were dropped with no log line (review 2026-09-06).
+        //
+        // Why the drop is still right at RING_SLOTS: every slot then holds a record we never read and
+        // the launcher's NEXT write targets slot head % 64 -- exactly where record `tail` lives -- so
+        // reading it would copy a 208-byte struct being concurrently overwritten, half of one edit and
+        // half of the next. The honest response is to drop the whole backlog: the next model publish
+        // re-syncs what the panel shows, and chasing 64 stale edits would replay old values over new
+        // ones.
         tail = head;
         InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_srv.hdr->tail), tail);
         return;
     }
 
     while (tail < head) {
+        EditRecord* slot = &g_srv.hdr->edits[static_cast<std::size_t>(tail) % RING_SLOTS];
         EditRecord local;      // copy out: applying it takes a JNI call, and the launcher may be
-        std::memcpy(&local, &g_srv.hdr->edits[static_cast<std::size_t>(tail) % RING_SLOTS], sizeof local);
+        std::memcpy(&local, slot, sizeof local);
         if (!applyEdit(local)) break;
+        // Wipe the slot before the tail bump. An EDIT_TEXT record carries a setting's value in the
+        // clear -- the AutoLogin password among them -- and a consumed record used to sit in the 32 MB
+        // section for the rest of the session, readable by anything in the session that opens the
+        // mapping by name and present in any full-memory dump of this process (review 2026-09-06).
+        // Safe here: the slot the launcher may write next is head % 64, and head - tail < RING_SLOTS
+        // means that is never this one. The local copy dies with this iteration's stack frame.
+        SecureZeroMemory(slot, sizeof *slot);
+        SecureZeroMemory(&local, sizeof local);
         ++tail;
         InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_srv.hdr->tail), tail);
     }
@@ -690,16 +739,23 @@ inline void tick() {
             // The revision is only consumed on SUCCESS: a rejected snapshot leaves g_publishedRevision
             // pointing at the last good model, so the comparison above stays true and this retries at
             // the rate limit until Java can produce the model it already announced.
-            g_nextSnapshotRetryMs = now + 1000;
+            //
+            // The rate limit belongs to the FAILURE path alone. Arming it before the attempt (as this
+            // did) also throttled the good case: a publish that succeeded blocked the next one for a
+            // second, so a toggle or a status line landing just after a publish waited up to 1 s to
+            // reach the strip -- most visible on reset rows, which have no optimistic echo to cover
+            // the gap (review 2026-09-06).
             if (publishModel(rev)) {
                 g_publishedRevision = rev;
+                g_nextSnapshotRetryMs = 0;
                 if (g_rejected) {
                     g_rejected = false;
-                    std::printf("[bridge] snapshot recovered\n");
+                    kk::logf("[bridge] snapshot recovered\n");
                     std::fflush(stdout);
                 }
             } else {
                 g_rejected = true;
+                g_nextSnapshotRetryMs = now + 1000;
             }
         }
         drainEdits();

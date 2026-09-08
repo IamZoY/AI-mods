@@ -50,6 +50,16 @@ public final class Config {
         return add(new Setting(key, label, description, Setting.Kind.TEXT, def, 0, 0));
     }
 
+    /**
+     * A text box whose value is a secret: masked wherever the panels draw it and wherever anything
+     * logs it, editable only in a password-mode field. Otherwise exactly a {@link #text} setting --
+     * same kind, same persistence through the profile store, same reset and listeners -- so a
+     * plugin that declares one accepts that the value lives in the profile's config.json.
+     */
+    public Setting secret(String key, String label, String description, String def) {
+        return add(new Setting(key, label, description, Setting.Kind.TEXT, def, 0, 0, null, true));
+    }
+
     /** A colour swatch you can click to open a picker. */
     public Setting colour(String key, String label, String description, Color def) {
         return add(new Setting(key, label, description, Setting.Kind.COLOR, def, 0, 0));

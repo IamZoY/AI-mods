@@ -136,6 +136,35 @@ public abstract class Plugin {
      */
     public int hotkey() { return -1; }
 
+    // -- developer scaffolding. The panel lists ten plugins and four of them are test rigs or worked
+    //    examples the RuneLite ports have replaced; the user asked for them out of the way, not gone.
+
+    // Written once, while KewlKlient builds its registry, and read every frame from the bridge's
+    // snapshot thread -- volatile for the same reason `enabled` is: two threads, no lock.
+    private volatile boolean developerFlag;
+
+    /**
+     * Whether this is developer scaffolding: a smoke test, a probe, or a worked example kept for
+     * reference rather than use. Both panels sort these last and put them under a "Developer"
+     * heading; nothing else about the plugin changes, and it stays as enable-able as any other.
+     *
+     * <p>Defaulted, so no existing plugin has to say anything. Two ways to say yes: override this to
+     * return {@code true} (a plugin that knows it is a test rig), or call {@link #markDeveloper()}
+     * from the registry (a plugin whose own class should not have to know how the panel groups it --
+     * {@code kewl.rl.RlitePlugin} wraps four different plugins and only two of them are tests).</p>
+     */
+    public boolean developer() { return developerFlag; }
+
+    /**
+     * Mark this instance as developer scaffolding, returning it so the registry line stays one line:
+     * {@code new kewl.plugins.NpcVisuals().markDeveloper()}. Call it before the plugin is published
+     * -- {@link KewlKlient}'s list is built on one thread before anything reads it.
+     */
+    public final Plugin markDeveloper() {
+        developerFlag = true;
+        return this;
+    }
+
     /** Whether it is currently running. */
     public final boolean isEnabled() { return enabled; }
 

@@ -23,6 +23,11 @@ public abstract class OverlayPanel extends Overlay
 		super();
 		setResizable(true);
 		panelComponent.setPreferredSize(ComponentConstants.STANDARD_WIDTH);
+		// Seed the placement rectangle with the one dimension that is known before the first render.
+		// A panel's width is fixed by the line above; only its height depends on the rows a plugin
+		// adds. Seeding it means a right-aligned panel is horizontally correct on its FIRST frame
+		// instead of being flung off the right edge by a zero width.
+		getBounds().setSize(ComponentConstants.STANDARD_WIDTH, 0);
 	}
 
 	protected OverlayPanel(Plugin plugin)

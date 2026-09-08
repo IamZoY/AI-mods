@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cfloat>
 #include <algorithm>
+#include <io.h>          // _open_osfhandle / _dup2: the KEWL_LOG redirect in WinMain
+#include <fcntl.h>
 
 #include "imgui.h"
 #include "imgui_sw.hpp"
@@ -53,7 +55,8 @@ UINT g_msgActivate  = 0;      // launcher -> DLL message window: wParam 1 = acti
 HWND g_main = nullptr;
 int  g_clientW = 1600, g_clientH = 900;
 bool g_quit = false;
-bool g_kbMsgSeen = false;   // a keyboard message arrived since the last frame: see the poll block in frame()
+bool g_kbMsgSeen = false;   // a keyboard message arrived since the last frame. Once this has ever been
+                            // true the poll fallback in frame() retires for good -- delivery works.
 
 bool gamePumps();           // defined by the keyboard-handoff code below; guards every SetFocus
 
@@ -234,23 +237,36 @@ struct Bridge {
     size_t   size = 0;
     kewl_bridge::Header* hdr = nullptr;
 
+    // Why the last open() failed, for the strip's note: "the DLL never created it" was the only
+    // message, and it was wrong on the day the mapping WAS there and only its mutex was misnamed
+    // (2026-09-05). Each step names itself so the next such failure is a one-line diagnosis.
+    std::wstring why;
+
     bool open(DWORD pid) {
         close();
         std::wstring name = L"Local\\KewlKlientBridge-" + std::to_wstring(pid);
         map = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name.c_str());
-        if (!map) return false;
+        if (!map) { why = L"no mapping " + name + L" (did launcher mode engage in the DLL?)"; return false; }
         mtx = OpenMutexW(SYNCHRONIZE, FALSE, (name + L"-mtx").c_str());
-        if (!mtx) { close(); return false; }        // mapping without its mutex is a half-built bridge
+        if (!mtx) {                                  // mapping without its mutex is a half-built bridge
+            why = L"mapping found but its mutex " + name + L"-mtx is missing (GetLastError=" +
+                  std::to_wstring(GetLastError()) + L")";
+            close(); return false;
+        }
         // Size probe first: MapViewOfFile with 0 maps the whole thing, which also tells us how much
         // the DLL created -- the model region's only real bound.
         base = (unsigned char*)MapViewOfFile(map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
-        if (!base) { close(); return false; }
+        if (!base) { why = L"MapViewOfFile failed (GetLastError=" + std::to_wstring(GetLastError()) + L")"; close(); return false; }
         MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery(base, &mbi, sizeof mbi)) { close(); return false; }
+        if (!VirtualQuery(base, &mbi, sizeof mbi)) { why = L"VirtualQuery failed"; close(); return false; }
         size = mbi.RegionSize;
-        if (size < kewl_bridge::MODEL_OFFSET) { close(); return false; }
+        if (size < kewl_bridge::MODEL_OFFSET) { why = L"mapping too small (" + std::to_wstring(size) + L" bytes)"; close(); return false; }
         hdr = (kewl_bridge::Header*)base;
-        if (hdr->magic != kewl_bridge::MAGIC || hdr->version != kewl_bridge::VERSION) { close(); return false; }
+        if (hdr->magic != kewl_bridge::MAGIC || hdr->version != kewl_bridge::VERSION) {
+            why = L"header magic/version mismatch (DLL and launcher from different builds?)";
+            close(); return false;
+        }
+        why.clear();
         return true;
     }
 
@@ -539,11 +555,17 @@ void writeEdit(std::int32_t kind, std::int32_t pluginIdx, const char* key,
     if (!g_bridge.hdr) return;
     std::int32_t head = g_bridge.hdr->head;         // our own index; the DLL never writes it
     std::int32_t tail = g_bridge.hdr->tail;
-    if (head - tail >= kewl_bridge::RING_SLOTS) {
+    // RING_SLOTS - 1, not RING_SLOTS: the DLL's drain treats head - tail == RING_SLOTS as a LAPPED
+    // ring and throws the whole backlog away, so filling the ring to exactly 64 records did not
+    // deliver 64 edits, it delivered none -- a 2.2 s DLL stall during a slider drag dropped every
+    // frame's edit including the final value, and the next publish snapped the slider back with no
+    // log line (review 2026-09-06). Refusing at 63 keeps the ring inside the invariant the DLL's
+    // guard documents: a full ring is 63 pending records, all of which get drained.
+    if (head - tail >= kewl_bridge::RING_SLOTS - 1) {
         if (!g_ringFullLogged) {
             g_ringFullLogged = true;
             std::printf("[bridge] edit ring full (the client has not drained %d edits) -- dropping "
-                        "kind %d until it catches up\n", kewl_bridge::RING_SLOTS, kind);
+                        "kind %d until it catches up\n", kewl_bridge::RING_SLOTS - 1, kind);
             std::fflush(stdout);
         }
         return;
@@ -561,6 +583,10 @@ void writeEdit(std::int32_t kind, std::int32_t pluginIdx, const char* key,
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_bridge.hdr->head), head + 1);
     InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_bridge.hdr->editSeq),
                           g_bridge.hdr->editSeq + 1);
+    // An EDIT_TEXT record can carry a password (AutoLogin's), so this stack copy does not outlive the
+    // write. The DLL wipes the shared slot the same way once it has applied the record
+    // (review 2026-09-06); the model region's own valueText copy is the format's, not ours to drop.
+    SecureZeroMemory(&rec, sizeof rec);
 
     // The message is what makes this arrive within a frame instead of whenever the DLL next polls
     // (it only sets a flag on the DLL side; the drain itself happens on the DLL's tick loop).
@@ -578,6 +604,7 @@ std::wstring g_status = L"Spawn the game, inject the DLL, embed it here.";
 std::wstring g_gamePath, g_dllPath, g_gameDir;
 std::wstring g_iniPath;                 // kewlklient.ini next to this exe: paths in, sidebar state out
 bool g_collapsed = false;               // the value persistCollapse last saw (and the ini holds)
+bool g_reducedMotion = false;           // ditto for the reduced-motion preference (persistUiPrefs)
 DWORD g_gamePid = 0;
 HWND  g_game = nullptr;                 // the game's window, a WS_CHILD of ours once embedded
 HANDLE g_gameProc = nullptr;            // to notice the game dying before it opens a window
@@ -601,6 +628,12 @@ void loadPaths() {
     // same file, its own key -- rather than in a second config file this launcher would own alone.
     kewl_panel::uiCollapsed() = iniString(g_iniPath, L"sidebar", L"open") == L"collapsed";
     g_collapsed = kewl_panel::uiCollapsed();
+    // Reduced motion is the same kind of state and MUST survive a restart for the same reason the
+    // OS-level setting does: someone who turns animation off did not turn it off for one session.
+    // Default "on" (springs run) because that is what the panel was designed against; the key is
+    // only ever written once the user has moved the switch.
+    kewl_panel::uiReducedMotion() = iniString(g_iniPath, L"motion", L"full") == L"reduced";
+    g_reducedMotion = kewl_panel::uiReducedMotion();
 }
 
 // Write the sidebar key when the panel's collapse toggle moved this frame, and re-layout so the
@@ -608,6 +641,14 @@ void loadPaths() {
 // from the frame loop rather than called from the click: the click lives in panel_ui.hpp, which
 // owns no file I/O and no ini path.
 void persistCollapse() {
+    // The reduced-motion switch rides the same poll: it is set in panel_ui.hpp's debug view, which
+    // owns no file I/O and no ini path, and it changes nothing about the layout -- so it writes its
+    // key and stops, where the collapse toggle also has to re-layout the embedded game.
+    if (kewl_panel::uiReducedMotion() != g_reducedMotion) {
+        g_reducedMotion = kewl_panel::uiReducedMotion();
+        WritePrivateProfileStringW(L"kewl", L"motion", g_reducedMotion ? L"reduced" : L"full",
+                                   g_iniPath.c_str());
+    }
     if (kewl_panel::uiCollapsed() == g_collapsed) return;
     g_collapsed = kewl_panel::uiCollapsed();
     WritePrivateProfileStringW(L"kewl", L"sidebar", g_collapsed ? L"collapsed" : L"open",
@@ -755,15 +796,30 @@ void selfHeal() {
     RECT gr{};
     GetClientRect(g_game, &gr);
     int gw = gr.right - gr.left, gh = gr.bottom - gr.top;
-    if ((gw != g_setGameW || gh != g_setGameH) && !IsZoomed(g_main)) {
-        g_setGameW = gw;                            // record even when refused, so a game size we
-        g_setGameH = gh;                            // won't host is not re-detected every frame
-        if (gw >= MIN_GAME_W) {
-            RECT fr{ 0, 0, gw + kewl_panel::effectivePanelW(), gh };
-            AdjustWindowRect(&fr, WS_OVERLAPPEDWINDOW, FALSE);
-            SetWindowPos(g_main, nullptr, 0, 0, fr.right - fr.left, fr.bottom - fr.top,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            // our own WM_SIZE runs layoutEmbed, which re-sizes the game to fit
+    if (gw != g_setGameW || gh != g_setGameH) {
+        if (IsZoomed(g_main)) {
+            // Maximized: the window size is the user's choice, so NXT's login-time snap-back has to
+            // LOSE here -- re-enforce the layout instead of adapting (adapting would resize us out of
+            // the maximize). Doing nothing, which is what this branch used to do, left the game child
+            // at NXT's saved size: 2122 wide inside a 1920 client (traced live), and a child paints
+            // over the parent's client area, so the 286px strip was covered and unreachable until the
+            // user un-maximized and re-maximized (review 2026-09-06).
+            layoutEmbed();
+            // layoutEmbed refuses below MIN_GAME_W without touching g_setGameW/H, so record the size
+            // here too: otherwise the condition above stays true and this branch re-fires every frame
+            // (a no-op loop, but the one asymmetry with the non-maximized path -- review 2026-09-06).
+            g_setGameW = gw;
+            g_setGameH = gh;
+        } else {
+            g_setGameW = gw;                        // record even when refused, so a game size we
+            g_setGameH = gh;                        // won't host is not re-detected every frame
+            if (gw >= MIN_GAME_W) {
+                RECT fr{ 0, 0, gw + kewl_panel::effectivePanelW(), gh };
+                AdjustWindowRect(&fr, WS_OVERLAPPEDWINDOW, FALSE);
+                SetWindowPos(g_main, nullptr, 0, 0, fr.right - fr.left, fr.bottom - fr.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                // our own WM_SIZE runs layoutEmbed, which re-sizes the game to fit
+            }
         }
     }
 }
@@ -789,17 +845,30 @@ void repostEmbed() {
 // Bridge upkeep for the embedded state: find the mapping after injection (the DLL creates it only
 // once the JVM is up -- JNI_CreateJavaVM alone takes seconds, and the bridge is built after that),
 // then pull the model when Java's revision moved. Polled here rather than awaited: the frame loop
-// must never block. The retry budget matches dllmain.cpp's launcher-detection patience (30 s): an
-// old-and-slow boot that gives up here at 5 s looked exactly like "the DLL never created it" while
-// the game's own log showed the bridge coming up three seconds later.
+// must never block. The first 30 s -- dllmain.cpp's launcher-detection patience -- are polled three
+// times a second and reported as "opening..."; an old-and-slow boot that gave up here at 5 s looked
+// exactly like "the DLL never created it" while the game's own log showed the bridge coming up three
+// seconds later. After that the polling continues at 2 s forever, because "slower than 30 s" is a
+// slow boot, not a failure (review 2026-09-06).
 void bridgeTick() {
     if (!g_bridge.hdr) {
-        if (nowSeconds() - g_phaseStart < 30.0) {
-            static double lastTry = 0;
-            if (nowSeconds() - lastTry > 0.3) { lastTry = nowSeconds(); g_bridge.open(g_gamePid); }
+        // Never STOP retrying, only slow down. The 30 s budget used to end the attempts as well as
+        // the optimistic note, so a JVM that took longer than that to come up (cold disk, an
+        // antivirus scan of kewlklient.jar, first-run JIT -- the mapping appeared at 35 s) left the
+        // strip dead for the whole session while the DLL's own log showed the bridge up
+        // (review 2026-09-06). After the budget the note names the real failure, and says we are
+        // still trying, which is now true.
+        const double waited = nowSeconds() - g_phaseStart;
+        const double interval = waited < 30.0 ? 0.3 : 2.0;
+        static double lastTry = 0;
+        if (nowSeconds() - lastTry > interval) { lastTry = nowSeconds(); g_bridge.open(g_gamePid); }
+        if (g_bridge.hdr) { g_bridgeNote.clear(); return; }    // opened just now: read it next frame
+        if (waited < 30.0) {
             g_bridgeNote = L"bridge: opening...";
         } else {
-            g_bridgeNote = L"bridge: the DLL never created it (did launcher mode engage?)";
+            g_bridgeNote = L"bridge: " + (g_bridge.why.empty()
+                               ? std::wstring(L"the DLL never created it (did launcher mode engage?)")
+                               : g_bridge.why) + L" -- still retrying";
         }
         return;
     }
@@ -945,11 +1014,157 @@ void keepKeyboard() {
 }
 
 // ---------------------------------------------------------------------------
-// Input. Everything the launcher's WndProc sees goes straight into ImGui's queue -- there is no
-// Java and no second window involved in panel input, which is the whole point of drawing the panel
-// here. Coordinates are launcher-client coordinates, the space io.DisplaySize describes.
+// Input. ONE path: the window messages this window's wndProc receives. A message only arrives when
+// the pointer or the keyboard focus is genuinely on the LAUNCHER -- the game is a child window of
+// ours, so anything aimed at IT is delivered to it and never shows up here. That discrimination is
+// the whole point, and it is exactly what the old "physical mouse as a safety net" block lacked: it
+// fed ImGui GetCursorPos + GetAsyncKeyState(VK_LBUTTON/RBUTTON/MBUTTON) every frame, and
+// GetAsyncKeyState is GLOBAL. A click aimed at the game passed the old position test (the game child
+// lives INSIDE our client rect, so the point was "over the launcher") and was handed to ImGui as a
+// click on the strip. The keyboard had the same two-path shape, and its poll read keys typed into
+// the game straight into the strip's text fields -- the password one included.
+//
+// What is left of the net is deliberately release-only (see reconcileMouse). Nothing below ever
+// synthesises a mouse-down, a key-down, or a position ONTO the strip out of physical state.
+// Coordinates are launcher-client coordinates, the space io.DisplaySize describes.
 // ---------------------------------------------------------------------------
-void feedMousePos(float x, float y) { ImGui::GetIO().AddMousePosEvent(x, y); }
+
+// One line per PATH change -- never per event, and never a key or a character value (a KEWL_LOG that
+// traced every WM_CHAR once logged the password field byte for byte, review 2026-09-06).
+enum { LOG_KB = 0, LOG_MOUSE = 1, LOG_SLOTS = 2 };
+void logInputPath(int slot, const char* what) {
+    static const char* last[LOG_SLOTS] = {};
+    if (last[slot] && std::strcmp(last[slot], what) == 0) return;
+    last[slot] = what;
+    std::printf("[input] %s\n", what);
+    std::fflush(stdout);
+}
+
+int  g_btnDownMask  = 0;      // buttons ImGui was told are down, by a MESSAGE (bit per ImGui button)
+bool g_mouseInside  = false;  // ImGui currently holds a valid position from us
+bool g_mouseTracked = false;  // TrackMouseEvent(TME_LEAVE) armed for the current hover
+bool g_captureHeld  = false;  // we called SetCapture and it stuck
+
+// Is this launcher-client point over the embedded game child? A rect test rather than
+// WindowFromPoint: the game belongs to another process and WindowFromPoint would also answer for
+// tooltips and menus floating over it, while the child's rect is precisely the region layoutEmbed
+// handed the game.
+bool overGameChild(POINT clientPt) {
+    if (!g_game || !IsWindow(g_game)) return false;
+    RECT r{};
+    if (!GetWindowRect(g_game, &r)) return false;        // child window rects come back in screen space
+    POINT screen = clientPt;
+    if (!ClientToScreen(g_main, &screen)) return false;
+    return PtInRect(&r, screen) != FALSE;
+}
+
+// The strip: our client area minus whatever the game child covers. The only region ImGui may ever be
+// told the pointer is in. In the home and fake-panel states there is no child, so it is the whole
+// client area and the "+ client" button works exactly as before.
+bool overStrip(POINT clientPt) {
+    return clientPt.x >= 0 && clientPt.y >= 0 && clientPt.x < g_clientW && clientPt.y < g_clientH &&
+           !overGameChild(clientPt);
+}
+
+void clearMousePos() {
+    if (!g_mouseInside) return;
+    ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);   // "the mouse left", in ImGui's own words
+    g_mouseInside = false;
+}
+
+void feedMousePos(POINT clientPt) {
+    // While a drag WE captured is in flight the pointer is allowed to be anywhere: those moves are
+    // ours until the release (the game is not seeing them either way), and pinning the position at
+    // the strip's edge would make a slider impossible to drag to its minimum -- the grab leaves the
+    // strip on the way there.
+    if (g_btnDownMask || overStrip(clientPt)) {
+        ImGui::GetIO().AddMousePosEvent((float)clientPt.x, (float)clientPt.y);
+        g_mouseInside = true;
+    } else {
+        clearMousePos();
+    }
+}
+
+void armMouseLeave() {
+    if (g_mouseTracked) return;
+    TRACKMOUSEEVENT tme{ sizeof tme, TME_LEAVE, g_main, 0 };
+    g_mouseTracked = TrackMouseEvent(&tme) != FALSE;
+}
+
+// SetCapture on button-down over the strip is the standard fix for the one real problem the old poll
+// was there to solve: press on the strip, drag off it, release over the game child -- the release
+// goes to whatever window is under the cursor and ImGui would hold the button down forever. With
+// capture the release always comes back to us as a message.
+//
+// One hazard worth naming: embedGame calls AttachThreadInput, and attached queues SHARE the mouse
+// capture, so while we hold it the game receives no mouse input at all. That is correct for the
+// length of a drag that started on the strip and wrong for one microsecond longer -- which is why
+// dropCapture is reachable from the button-up path, from WM_CAPTURECHANGED, and from
+// reconcileMouse's idle check, rather than from a single place that a lost message could skip.
+void takeCapture() {
+    if (g_captureHeld) return;
+    SetCapture(g_main);
+    g_captureHeld = (GetCapture() == g_main);            // SetCapture's return is the PREVIOUS owner
+    logInputPath(LOG_MOUSE, g_captureHeld
+        ? "mouse: window messages, capture held across drags"
+        : "mouse: window messages, SetCapture REFUSED -- release reconciliation covers drags");
+}
+
+void dropCapture() {
+    if (!g_captureHeld) return;
+    g_captureHeld = false;
+    ReleaseCapture();
+}
+
+void feedMouseButton(int btn, bool down, POINT clientPt) {
+    // Position first, and while g_btnDownMask still describes the drag in flight: a click's own
+    // coordinates decide which widget it lands on, and a button-down can be the first message after
+    // the pointer entered (the WM_MOUSEMOVE before it can be coalesced away).
+    feedMousePos(clientPt);
+    if (down) {
+        bool first = (g_btnDownMask == 0);
+        g_btnDownMask |= 1 << btn;
+        if (first) takeCapture();
+    } else {
+        g_btnDownMask &= ~(1 << btn);
+        if (!g_btnDownMask) dropCapture();
+    }
+    ImGui::GetIO().AddMouseButtonEvent(btn, down);
+}
+
+// The narrow safety net, run once per frame AFTER the pump has drained every pending message. Two
+// things the message path cannot see on its own:
+//   * a button pressed on the strip and released elsewhere while we do NOT hold capture (Wine can
+//     refuse SetCapture, and another window can steal it -- see WM_CAPTURECHANGED);
+//   * the pointer leaving our window without a WM_MOUSELEAVE ever arriving.
+// Only releases and leaves are synthesised. A DOWN is never synthesised from physical state, and a
+// position is never synthesised ONTO the strip -- that asymmetry IS the fix.
+void reconcileMouse() {
+    ImGuiIO& io = ImGui::GetIO();
+    POINT p{};
+    const bool haveCursor = GetCursorPos(&p) && ScreenToClient(g_main, &p);
+    const bool onStrip = haveCursor && overStrip(p);
+
+    if (GetCapture() != g_main) {
+        static const int vkBtn[3] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON };
+        for (int b = 0; b < 3; ++b) {
+            if (!io.MouseDown[b]) continue;
+            // Over the strip the release is delivered to US, so a disagreement here is a race with a
+            // message not yet dispatched, not a lost release. Off the strip this check runs every
+            // frame, so a button released over the game clears on the very next one -- long before
+            // the pointer could wander back onto the strip carrying a stale down.
+            if (onStrip) continue;
+            if (GetAsyncKeyState(vkBtn[b]) & 0x8000) continue;    // still physically held: a live drag
+            g_btnDownMask &= ~(1 << b);
+            io.AddMouseButtonEvent(b, false);
+            logInputPath(LOG_MOUSE, "mouse: synthesised a button release (no capture; the real one "
+                                    "went to another window)");
+        }
+    }
+
+    if (g_captureHeld && !g_btnDownMask) dropCapture();  // never hold the shared queue's capture idle
+    if (!g_btnDownMask && !onStrip) clearMousePos();
+}
 
 ImGuiKey vkToImGuiKey(WPARAM vk) {
     switch (vk) {
@@ -1036,7 +1251,10 @@ bool frame() {
         static bool fakeConfig = ::getenv("KEWL_FAKE_CONFIG") != nullptr;
         if (fakeConfig) {
             for (int i = 0; i < (int)g_plugins.size(); ++i)
-                if (g_plugins[i].hasConfig && !g_plugins[i].settings.empty()) {
+                // configurable(), not the raw field: that int is the plugin FLAGS word now
+                // (PLUGIN_FLAG_CONFIG | PLUGIN_FLAG_DEV), so testing it for non-zero would also
+                // answer yes for a developer-marked plugin with no settings at all.
+                if (g_plugins[i].configurable() && !g_plugins[i].settings.empty()) {
                     kewl_panel::debugPushConfig(i);
                     break;
                 }
@@ -1058,7 +1276,13 @@ bool frame() {
         // and well). The PROCESS is the thing we own: while it lives, go back to waiting and
         // re-embed on its current window. The second injectDll is a refcount-only LoadLibrary on
         // an already-loaded module -- DllMain does not run twice.
-        if (g_gameProc && WaitForSingleObject(g_gameProc, 0) != WAIT_OBJECT_0) {
+        // ... but a window that went away because WE asked it to is not a recreation. The game's
+        // window always dies before its process does, so this branch swallowed every close: the
+        // launcher flipped to "re-embedding...", waited 30 s for a window from a process that was
+        // shutting down, and landed back on the home screen with "osclient.exe exited before it
+        // opened a window" -- the buttonless-husk outcome the WM_CLOSE handler exists to avoid
+        // (review 2026-09-06). g_quitWhenGameGone is the difference and it is checked first.
+        if (!g_quitWhenGameGone && g_gameProc && WaitForSingleObject(g_gameProc, 0) != WAIT_OBJECT_0) {
             g_game = nullptr;
             setPhase(Phase::WaitWindow,
                      L"the game's window was recreated during boot -- re-embedding...");
@@ -1086,6 +1310,9 @@ bool frame() {
             if (g_gameProc && WaitForSingleObject(g_gameProc, 0) == WAIT_OBJECT_0) {
                 setPhase(Phase::Home, L"osclient.exe exited before it opened a window.");
                 CloseHandle(g_gameProc); g_gameProc = nullptr; g_gamePid = 0;
+                // A close request that got this far still ends the launcher rather than parking it
+                // on the home screen (review 2026-09-06) -- same rule as the embedded branch above.
+                if (g_quitWhenGameGone) { g_quit = true; return false; }
                 break;
             }
             HWND w = findGameWindow();
@@ -1140,55 +1367,74 @@ bool frame() {
     last = now;
     io.DisplaySize = ImVec2((float)g_clientW, (float)g_clientH);
 
-    // Physical mouse state as a safety net, NOT as the input path: the WndProc events below are the
-    // input path. The net exists because Wine hands WM_LBUTTONUP to the window under the cursor --
-    // drag off the strip into the game child and the release goes to the game, and ImGui would hold
-    // that button down forever.
-    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
-    {
-        POINT p{};
-        if (GetCursorPos(&p) && ScreenToClient(g_main, &p) &&
-            p.x >= 0 && p.y >= 0 && p.x < g_clientW && p.y < g_clientH) {
-            io.AddMousePosEvent((float)p.x, (float)p.y);
-        }
-        static const int vkBtn[3] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON };
-        for (int b = 0; b < 3; ++b) {
-            bool phys = (GetAsyncKeyState(vkBtn[b]) & 0x8000) != 0;
-            if (phys != io.MouseDown[b]) io.AddMouseButtonEvent(b, phys);
-        }
-    }
+    // Mouse: nothing to feed here. Every position, button and wheel event came in as a window
+    // message and is already in ImGui's queue. All this does is close the two holes a message can
+    // fall through -- a release that went to another window while we did not hold capture, and a
+    // pointer that left without a WM_MOUSELEAVE. It never invents a press or a hover.
+    reconcileMouse();
 
-    // Keyboard has TWO paths and the frame picks one. Messages (WM_KEYDOWN/WM_CHAR in wndProc,
-    // setting g_kbMsgSeen) are primary: they are exactly right when Wine delivers them -- which it
-    // does when this window holds Win32 + X focus (the fake-panel trace 2026-09-05 showed every
-    // WM_CHAR arriving once X focus sat on our window; the embed path's AttachThreadInput +
-    // keepKeyboard achieve the same state live). The POLL is the fallback for the sessions where
-    // delivery is dead: GetAsyncKeyState reads the physical keyboard regardless of which queue owns
-    // focus, the same way the mouse block above does. A frame that saw any keyboard message skips
-    // the poll, so the two paths can never double a key; a session where messages never arrive
-    // simply polls every frame. Poll costs: no auto-repeat, and keys typed into the game are also
-    // seen here -- which only matters when a text field is already active.
+    // Keyboard. Window messages (WM_KEYDOWN/WM_SYSKEYDOWN/WM_CHAR in wndProc, which latch
+    // g_kbMsgSeen) are THE path: they are exactly right when Wine delivers them, which it does once
+    // this window holds Win32 + X focus (the fake-panel trace 2026-09-05 showed every WM_CHAR
+    // arriving once X focus sat on our window; the embed path's AttachThreadInput + keepKeyboard
+    // reach the same state live).
+    //
+    // The poll survives only for the sessions where delivery is dead, and it is now gated twice:
+    //   * the moment ONE key message has ever arrived, delivery works and the poll is retired for
+    //     good. A sticky "recently" window instead of a latch would double every key on the frame
+    //     the two paths overlapped;
+    //   * it runs only while the LAUNCHER holds focus and is foreground. GetAsyncKeyState reads the
+    //     physical keyboard no matter which window owns it, so the ungated poll typed the game's
+    //     keystrokes into whatever strip field was live -- the AutoLogin password field included.
+    // Arming takes a silent snapshot so a key already held when the gate opens can never arrive as a
+    // fresh press, and closing the gate releases whatever the poll had reported down, so ImGui
+    // cannot be left holding a key across the handover.
     static bool s_prevPollDown[256] = {};
-    static int  s_kbPathLog = 0;                    // one line per path switch, for the record
-    if (!g_kbMsgSeen) {
-        if (s_kbPathLog != 1) { std::printf("[input] keyboard via polling\n"); s_kbPathLog = 1; }
-        for (int vk = 0; vk < 256; ++vk) {
-            bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-            if (down == s_prevPollDown[vk]) continue;
-            s_prevPollDown[vk] = down;
-            feedKey(vk, down);
-            if (down) {
-                BYTE kb[256] = {};
-                GetKeyboardState(kb);
-                WCHAR chars[8] = {};
-                int n = ToUnicode(vk, MapVirtualKeyW(vk, MAPVK_VK_TO_VSC), kb, chars, 8, 0);
-                for (int i = 0; i < n; ++i) io.AddInputCharacter(chars[i]);
+    static bool s_pollArmed = false;
+    static bool s_kbMsgEverSeen = false;
+    auto releasePolledKeys = [&]() {
+        if (!s_pollArmed) return;
+        for (int vk = 8; vk < 256; ++vk) {
+            if (!s_prevPollDown[vk]) continue;
+            s_prevPollDown[vk] = false;
+            feedKey(vk, false);
+        }
+        s_pollArmed = false;
+    };
+
+    const bool kbMsgThisFrame = g_kbMsgSeen;
+    g_kbMsgSeen = false;
+    if (kbMsgThisFrame) s_kbMsgEverSeen = true;
+    // GetFocus answers for the input queue our thread is attached to, which after embedGame is the
+    // game's queue as well -- so this is genuinely "the strip has the keyboard", not "our process
+    // exists". Both halves are required: focus without foreground is a backgrounded launcher.
+    const bool focusHere = (GetFocus() == g_main) && (GetForegroundWindow() == g_main);
+    if (s_kbMsgEverSeen) {
+        logInputPath(LOG_KB, "keyboard: window messages");
+        releasePolledKeys();
+    } else if (!focusHere) {
+        releasePolledKeys();                        // the game has the keyboard: feed ImGui nothing
+    } else {
+        logInputPath(LOG_KB, "keyboard: polling (no key messages ever arrived; launcher has focus)");
+        if (!s_pollArmed) {
+            for (int vk = 8; vk < 256; ++vk)        // vk 8 up: skip VK_LBUTTON/RBUTTON/MBUTTON --
+                s_prevPollDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;   // mouse state is the
+            s_pollArmed = true;                     // mouse path's business, never the keyboard's
+        } else {
+            for (int vk = 8; vk < 256; ++vk) {
+                bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                if (down == s_prevPollDown[vk]) continue;
+                s_prevPollDown[vk] = down;
+                feedKey(vk, down);
+                if (down) {
+                    BYTE kb[256] = {};
+                    GetKeyboardState(kb);
+                    WCHAR chars[8] = {};
+                    int n = ToUnicode(vk, MapVirtualKeyW(vk, MAPVK_VK_TO_VSC), kb, chars, 8, 0);
+                    for (int i = 0; i < n; ++i) io.AddInputCharacter(chars[i]);
+                }
             }
         }
-    } else {
-        if (s_kbPathLog != 2) { std::printf("[input] keyboard via window messages\n"); s_kbPathLog = 2; }
-        g_kbMsgSeen = false;
-        std::fill(std::begin(s_prevPollDown), std::end(s_prevPollDown), false);
     }
 
     ImGui::NewFrame();
@@ -1286,8 +1532,33 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
 
     // ---- input -> ImGui ----------------------------------------------------
-    case WM_MOUSEMOVE:  feedMousePos((float)GET_X_LPARAM(l), (float)GET_Y_LPARAM(l)); return 0;
-    case WM_LBUTTONDOWN:
+    // These messages ARE the input path. They reach this proc only when the pointer is over OUR
+    // client area (or while we hold capture, which we only take for a drag that began on the strip),
+    // so a click aimed at the game child is delivered to the game and is invisible here -- exactly
+    // the discrimination the old GetAsyncKeyState poll could not make.
+    case WM_MOUSEMOVE: {
+        armMouseLeave();                            // so a pointer that leaves is reported, not guessed
+        POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        feedMousePos(p);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_mouseTracked = false;
+        if (!g_btnDownMask) clearMousePos();        // mid-drag the pointer is allowed to be outside
+        return 0;
+    case WM_CAPTURECHANGED:
+        // Someone took the capture off us mid-drag. Note it once and let reconcileMouse's
+        // release-only path cover the rest of this drag; do NOT re-take it, which would fight
+        // whatever window legitimately wanted it.
+        if (g_captureHeld) {
+            g_captureHeld = false;
+            logInputPath(LOG_MOUSE, "mouse: capture lost mid-drag -- release reconciliation covers it");
+        }
+        return 0;
+    // No per-key trace here, ever: with KEWL_LOG set the launcher once logged every WM_CHAR it got --
+    // which is the strip's own text fields, the password one included (review, 2026-09-06). The
+    // per-second [input] summary above is all the keyboard diagnosis this file offers.
+    case WM_LBUTTONDOWN: {
         // A click on the strip is a click on this window -- the game child got WM_LBUTTONDOWN
         // instead if the point was over it. Take keyboard focus back from the game here: the DLL
         // parks focus on the render view (see WM_ACTIVATE below), and without this a text field
@@ -1298,18 +1569,32 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // swallowed before Wine ever sees them. Clicking back into the game moves focus to the
         // game child's own window procedure, so nothing more is needed in that direction.
         if (gamePumps()) SetFocus(h);   // skipped while the game is not pumping: see gamePumps()
-        ImGui::GetIO().AddMouseButtonEvent(0, true);  return 0;
-    case WM_LBUTTONUP:   ImGui::GetIO().AddMouseButtonEvent(0, false); return 0;
-    case WM_RBUTTONDOWN: ImGui::GetIO().AddMouseButtonEvent(1, true);  return 0;
-    case WM_RBUTTONUP:   ImGui::GetIO().AddMouseButtonEvent(1, false); return 0;
-    case WM_MBUTTONDOWN: ImGui::GetIO().AddMouseButtonEvent(2, true);  return 0;
-    case WM_MBUTTONUP:   ImGui::GetIO().AddMouseButtonEvent(2, false); return 0;
+        POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        feedMouseButton(0, true, p);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP: {
+        const int btn  = (m == WM_LBUTTONUP) ? 0 : (m == WM_RBUTTONDOWN || m == WM_RBUTTONUP) ? 1 : 2;
+        const bool down = (m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN);
+        POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        feedMouseButton(btn, down, p);
+        return 0;
+    }
     case WM_MOUSEWHEEL: {
         // Wheel coordinates arrive in SCREEN space (windowsx GET_X_LPARAM on lParam), unlike every
         // other mouse message -- the same trap dllmain.cpp's panel handler documents.
         POINT p{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         ScreenToClient(h, &p);
-        feedMousePos((float)p.x, (float)p.y);
+        // The wheel is the one mouse message Windows routes by FOCUS, not by the window under the
+        // cursor: with a strip text field live, a scroll over the game arrives here. Feeding it
+        // would scroll the plugin list while the user is scrolling the game, so the position test
+        // decides -- the same rule every other event obeys.
+        if (!g_btnDownMask && !overStrip(p)) return 0;
+        feedMousePos(p);
         ImGui::GetIO().AddMouseWheelEvent(0.0f,
             (float)GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA);
         return 0;
@@ -1319,14 +1604,11 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     // routes keystrokes here at all, both arrive and the poll never engages.
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        if (::getenv("KEWL_LOG")) std::printf("[input] WM_KEYDOWN vk=0x%x\n", (unsigned)w);
         g_kbMsgSeen = true; feedKey(w, true);  return 0;
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        if (::getenv("KEWL_LOG")) std::printf("[input] WM_KEYUP vk=0x%x\n", (unsigned)w);
         g_kbMsgSeen = true; feedKey(w, false); return 0;
     case WM_CHAR:
-        if (::getenv("KEWL_LOG")) std::printf("[input] WM_CHAR 0x%x\n", (unsigned)w);
         g_kbMsgSeen = true; ImGui::GetIO().AddInputCharacter((unsigned int)w); return 0;
 
     // Keyboard focus lives with the game (the DLL holds it on JagRenderView via the attached input
@@ -1348,17 +1630,44 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }  // namespace
 
 // WinMain, not wWinMain, on purpose: mingw needs -municode for the wide entry point and silently
-// fails to link without it. We take no command-line arguments, so the narrow entry costs us nothing.
-int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
+// fails to link without it. The one argument we take (--launch) is ASCII, so the narrow entry costs
+// us nothing.
+int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmdLine, int show) {
     g_msgEmbed    = RegisterWindowMessageW(L"KewlKlientEmbed");
     g_msgEdit     = RegisterWindowMessageW(L"KewlKlientBridgeEdit");
     g_msgActivate = RegisterWindowMessageW(L"KewlKlientBridgeActivate");
 
     // Same redirect DllMain does: a GUI-subsystem process has no console, so without this every
     // printf (ours, and the [input] trace in frame()) vanishes. KEWL_LOG=<win path>.
-    if (const char* log = ::getenv("KEWL_LOG"))
-        if (FILE* f = std::freopen(log, "w", stdout))
-            std::setvbuf(f, nullptr, _IONBF, 0);
+    //
+    // Opened exactly the way client/log.hpp opens it in the game process, because both processes
+    // write this one file. Two things the old DeleteFileA + freopen(log, "a") pair got wrong
+    // (review 2026-09-06):
+    //   * msvcrt's "a" stream seeks to the end and then writes, which is not atomic. A [bridge] line
+    //     the DLL appended between our seek and our write landed under ours -- one garbled line per
+    //     collision, most likely during the busy boot second when both sides log. FILE_APPEND_DATA
+    //     makes the kernel place every write at the current end of file instead.
+    //   * a previous game process still shutting down holds the log open with FILE_SHARE_DELETE, so
+    //     DeleteFileA "succeeds" (delete-pending), the name stays taken, freopen then fails with
+    //     access denied and the launcher logs NOTHING for the run with no sign of it. CREATE_ALWAYS
+    //     truncates in place, which needs no free name.
+    // If any step fails, stdout stays as it was -- no log, but nothing worse than that.
+    if (const char* log = ::getenv("KEWL_LOG")) {
+        HANDLE h = CreateFileA(log, FILE_APPEND_DATA | GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_APPEND | _O_WRONLY);
+            if (fd == -1) {
+                CloseHandle(h);
+            } else {
+                // _dup2 duplicates the handle onto stdout's descriptor, so closing fd afterwards
+                // leaves stdout owning a live handle of its own.
+                if (_dup2(fd, _fileno(stdout)) == 0) std::setvbuf(stdout, nullptr, _IONBF, 0);
+                _close(fd);
+            }
+        }
+    }
 
     loadPaths();
     initImGui();
@@ -1381,6 +1690,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
                            CW_USEDEFAULT, CW_USEDEFAULT, fr.right - fr.left, fr.bottom - fr.top,
                            nullptr, nullptr, inst, nullptr);
     ShowWindow(g_main, show);
+
+    // `KewlKlient.exe --launch` (or KEWL_AUTOSTART=1 in the environment) presses "+ client" itself,
+    // so `gradlew run` from a terminal, a desktop shortcut, or a test script can go straight to the
+    // game without a mouse. Exactly the button's path -- startLaunch() validates the ini paths and
+    // puts any failure in the status line the home screen shows -- nothing is bypassed.
+    if ((cmdLine && std::strstr(cmdLine, "--launch")) || ::getenv("KEWL_AUTOSTART"))
+        startLaunch();
 
     // Frame-paced message pump: ~30fps like the DLL's loop, but the launcher never sleeps past a
     // message -- PeekMessage drains everything pending before each frame.

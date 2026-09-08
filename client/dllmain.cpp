@@ -26,8 +26,10 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <tlhelp32.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cwchar>
 #include <string>
 #include <vector>
 #include "game.hpp"
@@ -123,6 +125,12 @@ BOOL CALLBACK pickWindow(HWND h, LPARAM lp) {
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
     if (pid != GetCurrentProcessId() || !IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    // Our OWN top-levels are in this process too. Nothing looked at them before, because the only
+    // caller ran before either existed -- but the frame loop re-runs this search when the game's
+    // window is recreated (review 2026-09-06), and by then the direct-inject host is the biggest
+    // window we own (game + panel strip). Adopting it as "the game" would SetParent it into itself.
+    // The panel is an OWNED popup and the bridge window is hidden, so the two below are enough.
+    if (h == g_host || h == kk::g_overlay.hwnd) return TRUE;
     RECT r{};
     GetClientRect(h, &r);
     long area = (r.right - r.left) * (r.bottom - r.top);
@@ -156,11 +164,15 @@ BOOL CALLBACK pickEmbedded(HWND h, LPARAM lp) {
 
 HWND findEmbeddedGameWindow() {
     HWND found = nullptr;
+    // Walk EVERY top-level window's children, whoever owns the top-level: once the launcher has
+    // SetParent'ed the game into its own window, the game window's root belongs to the LAUNCHER's
+    // pid, so a walk restricted to our own pid's top-levels can never reach it. (Seen live on
+    // Windows 2026-09-05: the launcher embeds within milliseconds of injecting, this thread found
+    // nothing for 60 s and gave up, and the strip sat on "waiting for the DLL bridge" forever.)
+    // pickEmbedded does the pid filtering on the children themselves.
     EnumWindows([](HWND top, LPARAM lp) -> BOOL {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(top, &pid);
-        if (pid == GetCurrentProcessId()) EnumChildWindows(top, pickEmbedded, lp);
-        return TRUE;
+        EnumChildWindows(top, pickEmbedded, lp);
+        return *reinterpret_cast<HWND*>(lp) == nullptr;    // stop once found
     }, reinterpret_cast<LPARAM>(&found));
     return found;
 }
@@ -212,6 +224,23 @@ void watchForLauncher(HWND game) {
     if (g_gameProcOriginal) return;
     g_gameProcOriginal = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(game, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(gameTopProc)));
+}
+
+/// Re-resolve the game window after NXT destroyed and recreated it, and re-arm everything that was
+/// bound to the OLD handle. NXT replaces its main window during boot (live 2026-09-05: a few hundred
+/// ms after injection), and every path here used to treat that as "the game closed" -- the wait loop
+/// polled a dead handle for 30 s, the frame loop returned and tore the overlay, the bridge and the
+/// JVM tick down while the game ran on, and the launcher happily re-embedded a window whose DLL was
+/// already gone (review 2026-09-06). Returns true when a different, live window was adopted.
+bool reacquireGameWindow() {
+    HWND w = findGameWindow();
+    if (!w) w = findEmbeddedGameWindow();               // the launcher may have embedded it already
+    if (!w || w == g_game) return false;
+    g_game = w;
+    kk::g_gameWindow = g_game;
+    g_gameProcOriginal = nullptr;   // the embed-message subclass died with the old window
+    watchForLauncher(g_game);       // ... so put it back on the new one
+    return true;
 }
 
 /// True when the game window is already somebody's child -- i.e. the launcher has embedded it. `root`
@@ -288,6 +317,12 @@ bool detectLauncherMode() {
     // than a slow start; a launcher that signalled and then died within thirty seconds is not a
     // launcher worth second-guessing.
     for (int i = 0; i < 300; ++i) {
+        // The window we are waiting on can be replaced under us mid-boot. Polling the dead handle for
+        // the rest of the 30 s meant every signal (embed message, property, already-a-child) was
+        // being read off a window that no longer existed, and the fallback then built a host around a
+        // zero rect and SetParent'ed a dead hwnd. Re-resolve first, then test the signals on the
+        // window that actually exists (review 2026-09-06).
+        if (!IsWindow(g_game) && !reacquireGameWindow()) { Sleep(100); continue; }
         if (alreadyEmbedded(g_game, root)) { g_host = root; return true; }
         prop = launcherProp(g_game);
         if (prop && IsWindow(prop)) { g_host = prop; return true; }
@@ -472,14 +507,74 @@ void attachInput() {
     if (tidTop) AttachThreadInput(myTid, tidTop, TRUE);
     if (tidRv && tidRv != tidTop) AttachThreadInput(myTid, tidRv, TRUE);
     giveGameFocus();
+    // Button-press latch for nInput (jvm.hpp): the render view's thread is the one that receives
+    // the clicks, so hook that one (falls back to the top-level's when there is no render view).
+    kk::installMouseLatch(g_renderView ? g_renderView : g_game);
 
     // Subclass the render view so the cursor over the game is always a real arrow (see
     // renderViewProc). After the input-queue attaches, so the subclass cannot disturb anything
-    // NXT's startup does with the window.
-    if (g_renderView && IsWindow(g_renderView)) {
+    // NXT's startup does with the window. The "not already ours" test matters since this function
+    // runs again after a window recreation (review 2026-09-06): subclassing the SAME window twice
+    // would store renderViewProc as its own original and CallWindowProcW would recurse forever.
+    if (g_renderView && IsWindow(g_renderView) &&
+        reinterpret_cast<WNDPROC>(GetWindowLongPtrW(g_renderView, GWLP_WNDPROC)) != renderViewProc) {
         g_rvProcOriginal = reinterpret_cast<WNDPROC>(
             SetWindowLongPtrW(g_renderView, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(renderViewProc)));
     }
+}
+
+// The host exe's FileVersion string ("240-6"), read off its own PE version resource. This is the one
+// thing about the build we can check WITHOUT trusting offsets.hpp first, so it is what the refusal
+// below keys on. Empty when the exe carries no version resource at all.
+std::wstring hostFileVersion() {
+    wchar_t exe[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return L"";
+    DWORD size = GetFileVersionInfoSizeW(exe, nullptr);
+    if (!size) return L"";
+    std::vector<unsigned char> buf(size);
+    if (!GetFileVersionInfoW(exe, 0, size, buf.data())) return L"";
+    // The string table is keyed by language+codepage; ask the translation table which one exists
+    // rather than guessing 040904B0.
+    struct Lang { WORD lang, cp; };
+    Lang* langs = nullptr; UINT langBytes = 0;
+    if (!VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<void**>(&langs), &langBytes)
+        || langBytes < sizeof(Lang)) return L"";
+    for (UINT i = 0; i < langBytes / sizeof(Lang); ++i) {
+        wchar_t key[64];
+        std::swprintf(key, 64, L"\\StringFileInfo\\%04x%04x\\FileVersion", langs[i].lang, langs[i].cp);
+        wchar_t* val = nullptr; UINT valLen = 0;
+        if (VerQueryValueW(buf.data(), key, reinterpret_cast<void**>(&val), &valLen) && val && valLen)
+            return std::wstring(val, wcsnlen(val, valLen));
+    }
+    return L"";
+}
+
+// Refuse a client this DLL was not measured on. Every number in offsets.hpp is for one build; against
+// any other, a struct offset reads a plausible wrong value and an RVA call crashes the game. Returns
+// the message to show, or "" when the build matches. KEWL_SKIP_BUILD_CHECK=1 overrides -- for the
+// deob workflow, where running the DLL against a NEW build to hook-and-log is the whole point -- and
+// says so in the log, so a wrong number can never masquerade as a logic bug quietly.
+std::string checkBuild() {
+    const std::wstring have = hostFileVersion();
+    const std::wstring want = kk::off::BUILD_VERSION;
+    if (have == want) {
+        kk::logf("[build] osclient.exe %s matches offsets.hpp (client-%s)\n",
+                    kk::narrow(have).c_str(), kk::narrow(want).c_str());
+        return "";
+    }
+    const std::string shown = have.empty() ? "(no version resource)" : kk::narrow(have);
+    if (::getenv("KEWL_SKIP_BUILD_CHECK")) {
+        kk::logf("[build] WARNING: osclient.exe %s but offsets.hpp is for client-%s -- "
+                    "KEWL_SKIP_BUILD_CHECK set, every offset is now suspect\n",
+                    shown.c_str(), kk::narrow(want).c_str());
+        return "";
+    }
+    kk::logf("[build] REFUSED: osclient.exe %s, offsets.hpp is for client-%s\n",
+                shown.c_str(), kk::narrow(want).c_str());
+    return "this is osclient.exe " + shown + ", but kewlklient.dll was built for client-" +
+           kk::narrow(want) + ". Not reading its memory: every offset in client/offsets.hpp was "
+           "measured on that build. Run the matching client, or re-derive the offsets "
+           "(.claude/skills/deob) and bump BUILD_VERSION with them.";
 }
 
 DWORD WINAPI run(LPVOID module) {
@@ -498,7 +593,14 @@ DWORD WINAPI run(LPVOID module) {
         if (!g_game && i > 20) g_game = findEmbeddedGameWindow();
         if (!g_game) Sleep(100);
     }
-    if (!g_game) return 0;
+    if (!g_game) {
+        // Say so: a silent return here is indistinguishable, from the launcher's side, from a DLL
+        // that never loaded.
+        kk::logf("[dll] no game window found in 60 s (top-level or embedded) -- giving up\n");
+        return 0;
+    }
+    kk::logf("[dll] game window %p (%s)\n", (void*)g_game,
+                GetAncestor(g_game, GA_ROOT) == g_game ? "top-level" : "embedded");
     kk::g_gameWindow = g_game;
 
     // Which mode are we in? Decided once, before anything is built: launcher mode skips the host and
@@ -551,7 +653,13 @@ DWORD WINAPI run(LPVOID module) {
 
     std::wstring javaHome = iniString(ini, L"java", L"");
     std::wstring jar      = dir + L"\\kewlklient.jar";
-    if (javaHome.empty()) {
+    // The build check comes first: with g_javaError set the loop below never ticks the JVM, so no
+    // native ever reads game memory. The message renders natively over the game like any other
+    // start-up failure.
+    g_javaError = checkBuild();
+    if (!g_javaError.empty()) {
+        // said above
+    } else if (javaHome.empty()) {
         g_javaError = "java= is not set in kewlklient.ini";
     } else if (!kk::startJvm(javaHome, jar, g_javaError)) {
         // g_javaError already says what went wrong.
@@ -567,7 +675,7 @@ DWORD WINAPI run(LPVOID module) {
     if (launcherMode && !kk::bridge::start(static_cast<HMODULE>(module), g_host)) {
         // The bridge is the panel's whole lifeline in this mode, but a refusal here must not take the
         // game down: the panel just stays empty while the overlays keep working.
-        std::printf("[bridge] could not create the shared mapping -- panel data unavailable (GetLastError=%lu)\n",
+        kk::logf("[bridge] could not create the shared mapping -- panel data unavailable (GetLastError=%lu)\n",
                     static_cast<unsigned long>(GetLastError()));
         std::fflush(stdout);
     }
@@ -615,8 +723,43 @@ DWORD WINAPI run(LPVOID module) {
 
     MSG msg{};
     int lastHostW = -1, lastHostH = -1;
-    while (IsWindow(g_game)) {
+    // When the game's window went away, in ticks. 0 while it is alive. The loop below ends when this
+    // has stood for five seconds -- i.e. the process really has no window any more, which is what a
+    // close looks like -- and NOT the instant one handle turns invalid.
+    std::uint64_t gameGoneSince = 0;
+    for (;;) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+
+        // The window is not the session. NXT destroys and recreates its main window during boot, and
+        // this loop used to return the moment that happened: overlay gone, bridge stopped, JVM never
+        // ticked again, while the game itself ran on and the launcher re-embedded the new window
+        // around a DLL that had already exited (review 2026-09-06). Re-resolve instead; only a
+        // process with no candidate window at all for five seconds ends the loop.
+        if (!IsWindow(g_game)) {
+            if (!reacquireGameWindow()) {
+                std::uint64_t now = GetTickCount64();
+                if (!gameGoneSince) gameGoneSince = now;
+                if (now - gameGoneSince >= 5000) break;
+                // Nothing to draw over: on a real close this is the game's last second and an overlay
+                // still floating above a dying window is the one visible cost of waiting at all.
+                if (IsWindowVisible(kk::g_overlay.hwnd)) ShowWindow(kk::g_overlay.hwnd, SW_HIDE);
+                Sleep(100);
+                continue;                              // do not tick Java against a dead window
+            }
+            gameGoneSince = 0;
+            kk::logf("[dll] game window was recreated -- now %p (%s)\n", (void*)g_game,
+                     GetAncestor(g_game, GA_ROOT) == g_game ? "top-level" : "embedded");
+            attachInput();                             // new render view: queues, latch, cursor subclass
+            if (!launcherMode) {
+                // Direct inject owns the embedding, so the new window has to be put back into our
+                // host exactly the way the startup path put the first one there. In launcher mode the
+                // launcher does this on its own schedule and anything here would fight it.
+                SetWindowLongPtrW(g_game, GWL_STYLE, WS_CHILD | WS_VISIBLE);
+                SetParent(g_game, g_host);
+                lastHostW = lastHostH = -1;            // force a fresh layout pass below
+                layoutEmbed();
+            }
+        }
 
         // Launcher mode owns none of the window sizing: the launcher lays the game child out and
         // adapts to NXT's snap-back itself (the same self-heal this loop does in direct inject). All
@@ -652,15 +795,29 @@ DWORD WINAPI run(LPVOID module) {
                 RECT gr{};
                 GetClientRect(g_game, &gr);
                 int gw = gr.right - gr.left, gh = gr.bottom - gr.top;
-                if ((gw != g_setGameW || gh != g_setGameH) && !IsZoomed(g_host)) {
-                    g_setGameW = gw;                     // record even when refused, so a game size we
-                    g_setGameH = gh;                     // won't host is not re-detected every frame
-                    if (gw >= 800) {
-                        RECT fr{ 0, 0, gw + PANEL_W, gh };
-                        AdjustWindowRect(&fr, WS_OVERLAPPEDWINDOW, FALSE);
-                        SetWindowPos(g_host, nullptr, 0, 0, fr.right - fr.left, fr.bottom - fr.top,
-                                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-                        // The host's own WM_SIZE runs layoutEmbed and re-docks the panel.
+                if (gw != g_setGameW || gh != g_setGameH) {
+                    if (IsZoomed(g_host)) {
+                        // Maximized: DO the re-enforcing this comment has always promised. Skipping
+                        // the branch entirely (the old `&& !IsZoomed`) left the game child at NXT's
+                        // saved size inside a maximized host -- wider than the client, painting over
+                        // the panel strip, until the user un-maximized and re-maximized
+                        // (review 2026-09-06). layoutEmbed re-sets g_setGameW/H, so this settles as
+                        // soon as NXT stops re-applying -- except below the 800px floor, where
+                        // layoutEmbed returns without touching g_setGameW/H, so record it here too
+                        // (review 2026-09-06).
+                        layoutEmbed();
+                        g_setGameW = gw;
+                        g_setGameH = gh;
+                    } else {
+                        g_setGameW = gw;                 // record even when refused, so a game size we
+                        g_setGameH = gh;                 // won't host is not re-detected every frame
+                        if (gw >= 800) {
+                            RECT fr{ 0, 0, gw + PANEL_W, gh };
+                            AdjustWindowRect(&fr, WS_OVERLAPPEDWINDOW, FALSE);
+                            SetWindowPos(g_host, nullptr, 0, 0, fr.right - fr.left, fr.bottom - fr.top,
+                                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                            // The host's own WM_SIZE runs layoutEmbed and re-docks the panel.
+                        }
                     }
                 }
             }
@@ -747,12 +904,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         // with no console, so a game it spawns inherits no stdout and every diagnostic vanishes.
         // KEWL_LOG=<path> redirects stdout to a file instead; the env var reaches this process
         // through the launcher, which inherits it from the shell that started it.
-        if (const char* log = ::getenv("KEWL_LOG")) {
-            // Append, not truncate: the launcher (which inherited this env var and opened the same
-            // file first) must not have its [input] trace erased from under it -- two processes
-            // freopen'ing "w" the same path made each write land in the other's sparse hole.
-            if (FILE* f = std::freopen(log, "a", stdout)) std::setvbuf(f, nullptr, _IONBF, 0);
-        }
+        // Appending, shared with the launcher (which inherited this env var and opened the same file
+        // first): its [input] trace and our lines interleave in one file. See log.hpp for why this is
+        // a kernel handle and not freopen(stdout) -- and why it must happen before the JVM starts.
+        if (const char* log = ::getenv("KEWL_LOG")) kk::logOpen(log);
+        kk::logf("[dll] attached to pid %lu\n", static_cast<unsigned long>(GetCurrentProcessId()));
         CreateThread(nullptr, 0, run, module, 0, nullptr);
     }
     return TRUE;

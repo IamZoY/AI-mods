@@ -142,6 +142,17 @@ public class ConfigManager
 			int value = def instanceof Integer i ? i : 0;
 			kewlConfig.number(key, label, desc, Math.max(min, Math.min(max, value)), min, max);
 		}
+		else if (type == double.class)
+		{
+			// RuneLite's NPC Indicators declares `double borderWidth()`; kewl has no fractional setting
+			// kind, so a double becomes the same INT slider an int gets (rounded default, @Range
+			// honoured). Whole-pixel widths are all the Java2D BasicStroke here ever needs, and a
+			// text box for "2.0" was the alternative -- unusable from the ImGui strip.
+			int min = range != null ? range.min() : 0;
+			int max = range != null ? range.max() : Integer.MAX_VALUE;
+			int value = def instanceof Double d ? (int) Math.round(d) : 0;
+			kewlConfig.number(key, label, desc, Math.max(min, Math.min(max, value)), min, max);
+		}
 		else if (type == Color.class)
 		{
 			kewlConfig.colour(key, label, desc, def instanceof Color c ? c : Color.WHITE);
@@ -218,6 +229,7 @@ public class ConfigManager
 	{
 		if (type == boolean.class) return false;
 		if (type == int.class) return 0;
+		if (type == double.class) return 0d;
 		if (type == Color.class) return Color.WHITE;
 		if (type == Keybind.class) return Keybind.NOT_SET;
 		if (type == String.class) return "";
@@ -275,6 +287,7 @@ public class ConfigManager
 		{
 			if (type == boolean.class) return s.asBool();
 			if (type == int.class) return s.asInt();
+			if (type == double.class) return (double) s.asInt(); // stored as an INT slider, see declare()
 			if (type == Color.class) return s.asColor();
 			if (type == String.class) return s.asText();
 			if (type == Keybind.class)

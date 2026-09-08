@@ -310,11 +310,26 @@ public final class Hub {
         synchronized (lock) {
             previous = installed.put(e.id(), next);
         }
+        Installed old = previous;
         Plugin outgoing = previous == null ? null : previous.plugin;
         Plugin incoming = loaded.plugin();
+        // Same order as doRemove, and for the same reasons: unregister on the frame thread, close the
+        // outgoing loader only once its plugin is out of the registry, unlink back on the worker
+        // because Windows will not delete a file a handle still holds. Review 2026-09-06: the update
+        // path did none of this -- every update leaked a PluginClassLoader (and every class it had
+        // loaded) for the life of the process and left the superseded jar open on disk, so a later
+        // "remove" could not delete the directory ("[hub] could not delete ...1.0.0.jar") and the
+        // next start-up still found it.
+        //
+        // The old jar is unlinked only when it is a DIFFERENT file from the incoming one: reinstalling
+        // the same version is a reload, and both records name the same path -- deleting it there would
+        // pull the jar out from under the loader that was just built on it.
+        boolean supersededJar = old != null && !old.jar.equals(jar);
         Plugin.later(() -> {
             if (outgoing != null) manager.unregister(outgoing);
+            if (old != null) old.closeLoader();
             manager.register(incoming);
+            if (supersededJar) worker.execute(() -> deleteIfExists(old.jar));
         });
         persistInstalled();
         state = State.READY;
@@ -323,18 +338,26 @@ public final class Hub {
     }
 
     private void doRemove(Installed i) throws Exception {
-        // The record leaves now, on this thread, for the same reason doInstall's arrives now: the
-        // launcher's tab should not wait a frame to stop advertising something the user deleted.
-        synchronized (lock) { installed.remove(i.id); }
         // Unregistering joins the frame thread (the registry is frame-thread state) and the loader is
         // closed after the plugin is out of it -- closing a classloader under a live plugin would pull
-        // the ground out from under its next tick. The jar itself is unlinked here, which is safe on
-        // Linux even while the loader still has it open, and the delete failure is caught either way.
+        // the ground out from under its next tick. The jar is unlinked only AFTER that close, and
+        // back on this worker: Windows refuses to delete a file another handle holds open, so
+        // deleting here, while the frame thread still owned the loader, left every removed plugin's
+        // jar on disk (HubEndToEndTest failed exactly there on Windows, 2026-09-05; Linux never
+        // noticed because unlinking an open file is fine there).
+        //
+        // Queued BEFORE the record leaves the map: "not installed any more" is the signal callers
+        // (and the end-to-end test) wait on before draining the frame queue, so the unload must
+        // already be in that queue when the signal fires or it is drained past and never runs.
+        Path dir = externalDir.resolve(i.id);
         Plugin.later(() -> {
             if (i.plugin != null) manager.unregister(i.plugin);
             i.closeLoader();
+            worker.execute(() -> deleteTree(dir));
         });
-        deleteTree(externalDir.resolve(i.id));
+        // The record leaves now, on this thread, for the same reason doInstall's arrives now: the
+        // launcher's tab should not wait a frame to stop advertising something the user deleted.
+        synchronized (lock) { installed.remove(i.id); }
         persistInstalled();
         System.out.println("[hub] removed " + i.id);
     }
@@ -504,11 +527,22 @@ public final class Hub {
         return o instanceof String s && !s.isBlank() ? s : null;
     }
 
+    /** Unlink one superseded jar, saying why if it will not go (see deleteTree's note on Windows). */
+    private static void deleteIfExists(Path file) {
+        try { Files.deleteIfExists(file); }
+        catch (IOException e) { System.out.println("[hub] could not delete " + file + ": " + e); }
+    }
+
     private static void deleteTree(Path dir) {
         if (!Files.exists(dir)) return;
         try (var walk = Files.walk(dir)) {
             walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
-                try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+                try { Files.deleteIfExists(p); }
+                catch (IOException e) {
+                    // Say which file and why: on Windows this is how "somebody still has the jar
+                    // open" shows up, and a swallowed exception here hid exactly that for a day.
+                    System.out.println("[hub] could not delete " + p + ": " + e);
+                }
             });
         } catch (IOException e) {
             System.out.println("[hub] could not delete " + dir + ": " + e);

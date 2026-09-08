@@ -54,15 +54,19 @@ public class PathMinimapOverlay extends Overlay
 			return null;
 		}
 
+		// kewl: ONE call, and clip to the shape that was actually judged. Asking twice re-resolved the
+		// widget and rebuilt the clip, so the shape checked for null was not necessarily the shape
+		// drawn against -- and the shape is now rebuilt whenever the minimap MOVES OR RESIZES, which
+		// is precisely the case this overlay has to follow.
 		Shape minimapClipArea = plugin.getMinimapClipArea();
 		if (minimapClipArea == null)
 		{
+			// Null means the shim will not vouch for the minimap rectangle this frame: the interface
+			// is not built, the minimap is toggled off, or its bounds are still parent-relative. Every
+			// one of those is "not this frame", never "draw at the origin".
 			return null;
 		}
-		else
-		{
-			graphics.setClip(plugin.getMinimapClipArea());
-		}
+		graphics.setClip(minimapClipArea);
 		graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
 
 		java.util.List<PathStep> pathPoints = plugin.getPathfinder().getPath();

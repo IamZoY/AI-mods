@@ -235,7 +235,9 @@ final class ConfigView {
                 g.setColor(Theme.TEXT);
                 String hint = "no keyboard on panel yet";
                 int hintW = g.getFontMetrics().stringWidth(hint);
-                g.drawString(Widgets.clip(g, s.asText(), w - hintW - 16), x + 5, by + 14);
+                // displayText, not asText: a secret (password) setting draws its fixed mask, never
+                // the characters and never anything as long as them.
+                g.drawString(Widgets.clip(g, s.displayText(), w - hintW - 16), x + 5, by + 14);
                 g.setFont(Theme.UI);
                 g.setColor(Theme.TEXT_DIM);
                 g.drawString(hint, ctx.right - hintW - 4, by + 14);

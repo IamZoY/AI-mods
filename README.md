@@ -21,7 +21,9 @@ endpoint you point it at, not a store of ours. What there is:
   small, and the reason it survives most game updates. (The one exception is the optional plugin
   hub, which fetches a manifest you point it at — see
   [docs/plugin-system.md](docs/plugin-system.md).)
-- **Twenty-one native methods.** That is the entire unsafe surface, all in one file.
+- **Twenty-five native methods.** That is the entire unsafe surface, all in one file
+  (`java/kewl/Natives.java` — the four input-injection ones, `postChar`/`postKey`/`postMouse`/
+  `inputTarget`, are part of that count: they are how autologin types your password).
 
 ```
        launcher (ImGui)               injected into the game
@@ -30,7 +32,7 @@ endpoint you point it at, not a store of ours. What there is:
     │              │ ── inject ──>  │  └─ kewlklient.dll             │
     │              │                │     reads memory               │
     │  286px ImGui │                │     starts a JVM ──────────────┼──> kewlklient.jar
-    │  panel strip │  <== shared == │     21 natives ────────────────┼──>   api + your plugins
+    │  panel strip │  <== shared == │     25 natives ────────────────┼──>   api + your plugins
     │  (CPU-raster)│     memory     │  <── one finished image/frame ─┼──    overlays (Java2D)
     └──────────────┘                └────────────────────────────────┘      plugin state (Java)
 ```
@@ -82,6 +84,12 @@ gradlew run
 Same thing. `gradlew dist` builds without launching, and `build.bat` is a wrapper around it for people
 who prefer a double-click.
 
+The launcher needs to know where the game is: set `game=` in `build\dist\kewlklient.ini` (relative
+paths resolve against the exe). `build\dist\KewlKlient.exe --launch` presses **+ client** for you, and
+`KEWL_LOG=<file>` in the environment collects the launcher's, the DLL's and Java's diagnostics in one
+file -- the DLL is built for one exact game build (`client/offsets.hpp`, `BUILD_VERSION`) and refuses
+any other, saying so on screen and in that log.
+
 A **panel strip** opens down the right-hand side of the game with a switch, a pin and settings for
 every plugin — plus tabs for profiles, the plugin hub and bridge debug info. The same plugins
 have hotkeys:
@@ -91,9 +99,16 @@ have hotkeys:
 | F1 | player visuals on/off |
 | F2 | NPC visuals on/off |
 | F5 | the woodcutter on/off |
-| F3, F4, F6–F8 | free, for your plugins |
+| F7 | autologin: on at the title screen = login now; on while running = abort |
+| F3, F4, F6, F8 | free, for your plugins |
 
-That table covers the built-ins only. The two shim-hosted plugins in the registry below declare no
+Default-on plugins are **NPC Indicators** (every NPC in range: hull and name; narrow it with the list)
+and **Player Indicators** (names over you and other players); the kewl `NpcVisuals`/`PlayerVisuals`
+examples stay in the list, off. **Anti-idle** taps a camera key every few minutes so the server does
+not log the account out; pair it with Autologin's "Log in again after a disconnect" for a session that
+also survives the disconnects it cannot prevent.
+
+That table covers the built-ins only. The five `RlitePlugin` entries in the registry below declare no
 hotkey; a ported RuneLite plugin's keys come from its own keybind settings, not this table.
 
 If nothing appears, see [Troubleshooting](#troubleshooting).
@@ -148,14 +163,29 @@ private static final List<Plugin> PLUGINS = new ArrayList<>(List.of(
         new kewl.plugins.CowSpotter(),         // <- yours
         new kewl.rl.RlitePlugin("Shortest Path", "Pathfinder over the world map, with auto-walk",
                 shortestpath.ShortestPathPlugin::new),
+        new kewl.rl.RlitePlugin("NPC Indicators", "Highlight NPCs by name or id: hull box, tile, true tile, name",
+                net.runelite.client.plugins.npchighlight.NpcIndicatorsPlugin::new),
+        new kewl.rl.RlitePlugin("Player Indicators", "Names over players, coloured by own/others",
+                net.runelite.client.plugins.playerindicators.PlayerIndicatorsPlugin::new),
         new kewl.rl.RlitePlugin("Test Rlite", "Shim smoke test: config, events, overlay",
-                kewl.rl.TestRlite::new)
+                kewl.rl.TestRlite::new),
+        new kewl.rl.RlitePlugin("Test Actors", "Shim smoke test: NPC/player actors, hull, name text, spawn events",
+                kewl.rl.TestActors::new),
+        new kewl.plugins.AutoLogin(),          // types your login (panel settings or autologin.properties) at the title screen
+        new kewl.plugins.AntiIdle()            // a camera-key tap every few minutes so the server does not log you out
 ));
 ```
 
-The last two are not hand-written plugins but the shim pattern: an adapter (`kewl.rl.RlitePlugin`)
-hosting a plugin ported off RuneLite's API. They are ordinary registry entries — panel, settings,
-profiles and all — and the reason the real list has five lines, not three.
+The `RlitePlugin` lines are not hand-written plugins but the shim pattern: an adapter
+(`kewl.rl.RlitePlugin`) hosting a plugin ported off RuneLite's API — Shortest Path, and RuneLite's
+own NPC Indicators and Player Indicators ported source-shaped onto the shim's actor API
+(`java/net/runelite/client/plugins/`). They are ordinary registry entries — panel, settings,
+profiles and all — and the reason the real list has ten lines, not five. The two Indicators ports
+are the **default-on** visuals since 2026-09-06, when hull, name and tile were seen sitting at each
+entity's real height in-game (kewl's own `NpcVisuals`/`PlayerVisuals` stay in the list as this
+README's worked examples, off unless you switch them on). They say in each setting's description
+what the shim approximates; what RuneLite offers but the client cannot read yet (menu recolouring,
+outlines, respawn timers, friend/clan colours) is omitted from their panels rather than shown dead.
 
 Rebuild, restart the client. Your plugin is in the panel with a range slider and a colour picker you
 never wrote, and its state is saved with everyone else's. **That list is the entire plugin system** —
@@ -213,10 +243,27 @@ Actions.walkTo(x, y)
 Actions.object(treeId, x, y)          // chop / mine / open
 Actions.npc(entity)                   // first option
 Actions.npc(entity, 2)                // second option
+
+// kewl.api.Input -- typing and clicking, by posting messages to the game window
+Input.typeChar(c)                     // one character, as WM_CHAR (never a key-down: see jvm.hpp)
+Input.key(Input.VK_TAB, down)         // Tab / Enter / Backspace as KEYDOWN / KEYUP
+Input.mouseDown(x, y)                 // canvas coordinates; honoured on client-240-6 (the autologin Login click is the proof)
+Input.target(grab)                    // where it goes: exists / render view / focused / foreground / size
 ```
 
+**Through the RuneLite shim** (for ported plugins, `net.runelite.api`), the same snapshot is reachable
+in RuneLite's own shape -- `client.getNpcs()`, `client.getPlayers()` (you included), `wv.npcs()` /
+`wv.players()` as `IndexedObjectSet`s, and `NpcSpawned`/`NpcDespawned`/`PlayerSpawned`/`PlayerDespawned`
+events. Each `NPC`/`Player` is an `Actor` with a stable identity per handle across ticks, and offers
+`getLocalLocation()` (the fine render position), `getWorldLocation()` (the local player's plane),
+`getCanvasTilePoly()` / `getCanvasTextLocation()` / `getConvexHull()` at the actor's own ground height,
+plus `OverlayUtil.renderActorOverlay`. What is approximated or defaulted, and says so in its javadoc:
+the convex hull (a prism, no model access), the logical height (a tuning constant, `Actor.logicalHeight`),
+combat level 0, NPC size 1, and names that may read `""` until the name offset is confirmed on this build.
+
 **Two coordinate systems, and mixing them up is the most common bug here.** World coordinates are what
-your minimap shows (Lumbridge ≈ 3222, 3218). Scene coordinates are 0–104 within the loaded chunk, and
+your minimap shows (Lumbridge ≈ 3222, 3218). Scene coordinates are 0–103 within the loaded chunk (it
+is 104 tiles a side, so 104 is one past the edge — `Game.toScene` returns null for it), and
 they are what the game's click function actually wants. Everything a plugin touches is in **world**
 coordinates; the conversion happens in one place.
 
@@ -238,6 +285,213 @@ Hud.panel(g, 12, 12, "My plugin", new Hud.Lines() // a statistics panel that siz
 
 Tile outlines go through the game's own projection corner by corner, so they sit on the ground with the
 right perspective and stay correct while the camera turns.
+
+---
+
+## Autologin
+
+The **Autologin** plugin (`kewl.plugins.AutoLogin`, last in the registry, off by default) types your
+account into the title screen. The credentials come from one of two places, checked afresh on every
+attempt:
+
+1. **The panel.** The first two settings on the plugin's config page are `Username` and `Password`
+   — type them into the AutoLogin settings in the panel (the ImGui strip of the launcher; the
+   direct-inject Java2D panel shows them but cannot edit text yet). The password field is a
+   password field: masked as you type, masked wherever either panel shows it, and never printed.
+   Like every setting, both are saved by the profile store into
+   `~/.kewlklient/profiles/<id>/config.json` — local, outside the repository, but on disk. Both
+   must be filled in for the panel to be used; a half-filled panel falls back to the file.
+   **The field holds 63 UTF-8 bytes**, the width of the bridge's `valueText` string (format 2), and
+   refuses the next one rather than accepting a value it could not publish back. A longer password
+   goes in the file below; widening the string is a bridge format 3 change.
+2. **The file**, for anyone who would rather keep the password out of the profile. In the client's
+   data directory (`KewlKlient.dataDir()` — `~/.kewlklient`, i.e. `C:\Users\<you>\.kewlklient` on
+   Windows):
+
+```
+~/.kewlklient/autologin.properties
+
+username=
+password=
+```
+
+Fill the two values in after the `=`. Everything after the first `=` is the value, verbatim — a
+backslash is a backslash, not an escape — with only surrounding whitespace trimmed. Lines starting
+with `#` are comments.
+
+**Both places are local.** Nothing under `~/.kewlklient` is tracked, and neither the properties
+file nor a profile's `config.json` must ever be committed, pasted into an issue, or attached to a
+log. The plugin itself never prints a character of either value, and never a length: every log line
+and the status column say only where the credentials came from and whether each is set
+(`credentials: panel, username set, password set` / `credentials: file, username set, password
+empty`). The `Password` setting is a `config.secret` (see `kewl.config.Config`): the same TEXT
+setting underneath, flagged so that both panels mask it and the launcher edits it in a password-mode
+field.
+
+**What "masked" does not mean.** Masking is about what is *drawn*, not about where the bytes live.
+Two places hold the password in clear, both under the same trust boundary — any process running as
+you can read them, nothing else can:
+
+- a profile's `config.json`, if you used the panel settings (that is the trade the panel makes);
+- the **shared-memory bridge**, while the game is running and only if you used the panel settings.
+  The strip is a separate process, so a text setting's value has to cross to it: the model region
+  (`Local\KewlKlientBridge-<gamePid>`) carries the setting's `valueText` in clear so the ImGui field
+  can round-trip it, and anything else running in your session can `OpenFileMappingW` that name and
+  read it for the life of the game process. A committed edit passes through the edit ring too, but
+  only for the frame it takes to apply: the DLL wipes the slot before bumping the tail. (Review
+  2026-09-06: the model region's copy was true but undocumented; the ring's is now transient.)
+  Nothing in the launcher ever prints
+  or copies a `FLAG_SECRET` value — password mode disables copy, and the tooltip, the debug tab and
+  the unknown-kind branch all refuse to render it — but that is a display rule, not a boundary.
+  **The file path does not cross the bridge**: leave the two panel settings empty and their
+  `valueText` is the empty string, so `autologin.properties` really does keep the password out of
+  both the profile store and shared memory.
+
+**Using it.** Switch it on in the panel or press F7. On at the title screen means "login now" (a
+0.5 s settle); on during start-up means "wait for the login screen, then type after `Settle delay`";
+pressing F7 again while it runs aborts. The profile remembers the switch, so it stays on across
+restarts once you have turned it on. The panel settings and the file are re-read at the start of
+every attempt, so filling either in while the client sits at the title screen is enough — it
+re-checks every 5 s.
+
+**After a logout.** Once logged in, the plugin stays quiet: if the title screen comes back — a
+deliberate logout looks exactly like a disconnect from the outside — it goes idle (`logged out --
+idle` in the status column) and waits for F7 / the panel toggle before typing anything again. Turn
+on `Log in again after a disconnect` (`reloginAfterDisconnect`, off by default) to have it re-type
+the login automatically whenever the title screen returns. The status panel is drawn only while
+not logged in.
+
+**Click here to play.** At state 30 the client first shows a "Welcome to Old School RuneScape /
+Welcome back" screen and the world only loads after its **CLICK HERE TO PLAY** button (seen live
+2026-09-06: not letterboxed, button centre at canvas centre − 3, top + 334). With `clickPlay` (on
+by default) the plugin clicks it once, `playDelaySec` (2 s) after state 30 arrives, logs
+`[autologin] clicked play`, and the status column shows `logged in -- clicked play`; the `play`
+crosshair is drawn until then. Only a login the plugin typed itself gets the click — a login done by
+hand while it sits idle does not. `playX` / `playY` move the target.
+
+**The flow it drives** (seen live 2026-09-06 on client-240-6): the title screen opens on a
+"Welcome to Old School RuneScape" box with New User / Existing User buttons; Existing User opens the
+form. With **"Remember username" ticked** — the default path, and what this machine has — the form
+opens with the Login field pre-filled and the caret already in the Password field. **Enter does not
+submit the form** on this build (neither a real keyboard Enter nor a posted one); clicking the Login
+button does. A rejected login shows a separate "Incorrect username or password" screen with a
+**Try again** button, and the raw game state stays 10 the whole time — a rejection is not
+distinguishable from "nothing happened" by state alone.
+
+What it does, per attempt **on the welcome screen**: settle → click Existing User → settle → 20
+backspaces (clearing the password field, where the caret already is) → password → Enter (harmless,
+kept in case another build honours it) → **click Login** → wait `Result timeout` for the game state
+to leave the login value. If the state has not moved by then, that is the rejection screen: it logs
+`no state change after Login click: assuming the rejection screen, clicking Try again`, clicks Try
+again, settles, and runs the attempt again, up to `Stop after N rejections` (2). With
+`Username remembered by the client` off it instead clicks the
+username field, backspaces, types the username, Tabs (or clicks) into the password field and goes on
+from there. Text is typed as `WM_CHAR` messages posted to the game's own render window, control keys
+as key-down/key-up, one keystroke per `Key delay` (60 ms) — never `SendInput`, so nothing can be
+typed into another application if you alt-tab away.
+
+**Which screen is up — state 10 is not one screen.** Live 2026-09-06: from a **cold start** the
+client draws the welcome box and the form only appears after the Existing User click; after a
+**disconnect** it draws the form straight away, username pre-filled, with *"Please enter your
+password"* and no welcome box at all. The old script assumed the cold start unconditionally — it
+clicked where Existing User would have been (on that screen it is not a button), typed into whatever
+had focus, submitted an empty password field twice and stopped with `rejected 2 times`. So the script
+now branches on the **screen** (`kewl.plugins.autologin.LoginScreen`), not on the state, and the two
+things it changes are all that differ: whether Existing User is clicked, and whether the password
+field is clicked before typing.
+
+The screen is decided from two sources, in order:
+
+1. **The client's loaded interface groups** (`Natives.loadedGroups()`) as a fingerprint. Widget
+   *positions* are not trustworthy on this build (see `client/offsets.hpp`: a packed id's stored x/y
+   are read as canvas coordinates with no parent-offset accumulation), but "which groups are loaded"
+   is a plain list the client hands over and it changes with the screen. `LoginScreen.KNOWN` maps a
+   fingerprint to a screen and **ships empty**: no id has been confirmed against a real screen yet,
+   and a wrong entry would make the cold start skip a click it needs. Run once with `KEWL_LOG` set
+   and the log carries one `login screen fingerprint [ids] -- ...` line per distinct screen; those
+   ids are what belongs in that map.
+2. **How the plugin got there**, used for every unknown fingerprint — i.e. all of them today. Title
+   screen reached from the loaded world = the **disconnect** screen; reached after a Try again click
+   = the **form**; anything else, a cold start above all, = the **welcome** box, which is exactly the
+   behaviour that has been working. A server bounce (20 → 10) deliberately keeps the old behaviour:
+   nobody has yet seen which screen follows one.
+
+The panel's `screen` line and the crosshairs say which is believed: on the disconnect screen
+`existing` goes dim and `pass` lights up.
+
+**Setting the fields directly (experimental, off).** `Set the fields directly (experimental)`
+(`setFieldsDirectly`) writes the username and password into the client's own buffers instead of
+typing them, which is immune to which screen is up and where the caret is. It is **off by default and
+NOT VERIFIED**: the username's address is found by searching memory for the value the client is
+already rendering, and the password's is taken at `LOGIN_PASSWORD_DELTA` (508) from it — a delta
+derived from a single live probe run, recorded in `client/offsets.hpp` and mirrored in
+`FieldWriter.PASSWORD_DELTA`. Every gate has to pass or it falls back to typing and says why in the
+status line:
+
+- a username hit that pairs with a password hit across **printable text** is a *document*, not the
+  client — on 2026-09-06 that document was this client's own `config.json` in the JVM heap, gap
+  `","password":"` — and is discarded;
+- the candidate password buffer must be **all zeroes** (the "Please enter your password" state);
+- there must be **exactly one** surviving candidate;
+- `Natives.setLoginField` — the only write into game memory in the whole client — refuses unless the
+  target is committed, `PAGE_READWRITE` (there is no `VirtualProtect`, ever), already holds either
+  all zeroes or exactly the value being written, has room in its existing content plus zero run, and
+  is not shaped like an inline `NxtString` whose length byte it will not guess.
+
+Nothing on any of those paths prints a value, a length, or a byte of a buffer — the bytes are
+classified, never dumped (`FieldWriterTest` asserts that across every path).
+
+**Jagex Accounts.** The standalone client cannot log a Jagex Account in at all — the rejection
+screen's own text says to use the Jagex Launcher — so for one of those every attempt is rejected and
+the plugin stops with `rejected 2 times -- check the credentials, and whether this is a Jagex
+Account ...`. Nothing here can work around that.
+
+**Reading the log.** KEWL_LOG carries the whole story under `[autologin]` and `[input]`:
+
+| line | means |
+|---|---|
+| `[input] target 0x... class=JagRenderView` | messages go to NXT's input window (anything else: wrong window) |
+| `[autologin] enabled: credentials: file, username set, password set; raw state 10` | credentials resolved (`panel` or `file`); 10 is the title screen |
+| `[autologin] state 0 -> 10 (raw)` | the client reached the title screen |
+| `[autologin] raw state X is not the configured login state 10 -- ...` | the title screen holds another value on this build: set `Raw game state of the login screen` to X |
+| `[autologin] attempt 1/3: target=JagRenderView focused=1 foreground=1 canvas=1314x900 (screen WELCOME, user remembered by the client, pass set)` | typing starts; `focused=0` with nothing typed is the thing to report |
+| `[autologin] login screen fingerprint [ids] -- not in LoginScreen.KNOWN; going by how we got here, which says DISCONNECT` | one line per distinct screen. **Note which screen was really up and put the ids in `LoginScreen.KNOWN`** — that is how the fingerprint stops being a fallback |
+| `[autologin] screen: DISCONNECT (from how we got here) -- no Existing User click` | which script this attempt got, and why |
+| `[autologin] direct write: 2 candidate field pair(s) among 4 username hits (1 ruled out as documents, ...) -- typing instead` | `setFieldsDirectly` is on and refused; counts and reasons only, never a value |
+| `[autologin] script done (K keys/clicks, Login clicked); waiting up to ...` | the script was posted (keys and clicks are counted, characters never — a count would give away the password length) |
+| `[autologin] submitted; state 10 -> 20 after N ms` | the client accepted the typed login — the injection works |
+| `[autologin] logged in (state 30)` | done |
+| `[autologin] no state change after Login click: assuming the rejection screen, clicking Try again (rejection 1/2)` | the "Incorrect username or password" screen (the state does not move for it); Try again is clicked and the attempt re-run |
+| `[autologin] rejected 2 times -- check the credentials, and whether this is a Jagex Account ...` | stopped, so a wrong password is never hammered; also what a Jagex Account looks like from here |
+| `[autologin] server bounced us back to the login screen (rejection 1/2)` | the state did leave 10 and came back — a server-side rejection on a build that changes state for it |
+| `[autologin] authenticator screen (state 11) -- stopped` | a human is needed |
+
+**Calibrating clicks.** Every click target is a pair of settings: **x is the offset from the canvas
+centre, y is the offset from the canvas TOP** (in canvas pixels). That convention is not arbitrary:
+NXT letterboxes its title screen — about 1090×670 of drawn content, centred horizontally in the
+canvas but top-aligned — so x offsets hold relative to the centre while y offsets hold relative to
+the top, whatever the window size. The defaults are the live measurements from 2026-09-06 (canvas
+1314×900): Existing User (+69, 288), Login button (−93, 315), Try again (−14, 288), username field
+(−82, 234), password field (−82, 257). All of them are drawn as crosshairs over the title screen
+while `Draw the click targets` is on (bright = the script will click it, dim = preview only), so
+line them up against the real buttons before anything is typed and adjust the numbers in the panel
+if your client draws the screen elsewhere. Posted clicks are honoured by this build (the Login click
+is what submits); the log's `state 10 -> 20` line is the proof for yours.
+
+**What stops it.** The authenticator screen, two rejections (the rejection screen after a Login
+click, or a bounce back to the login screen after the state changed), three attempts, the plugin
+being switched off, or the game state reaching one of the **four** values `LoginSequence.leftTitle`
+knows — 20 (logging in) or 25 (loading) = submitted, 30 = logged in, 11 = authenticator. After
+a disconnect it goes idle (or re-arms with the counters reset when `Log in again after a
+disconnect` is on).
+
+Any *other* state the client may pass through mid-script — the setter compares against 1, 2, 5, 6,
+40, 45 and 1000 as well — is not one of those four, so the script keeps posting the remaining
+keystrokes and the Login click into whatever screen is up. Nothing seen live has done that (the
+title screen holds 10 until the login is accepted), but do not read the old "leaving the login
+screen for any reason" wording as a guarantee: the guarantee is the four states above. Review
+2026-09-06.
+
 
 ---
 
@@ -333,11 +587,23 @@ runs as an ordinary kewl plugin on the overlay thread; see `java/net/runelite/RE
 vendored, what is shimming, and what waits on a new offset. (`resources/NOTICE-shortest-path` and
 `resources/LICENSE-shortest-path` are the licence side of the same story, not a technical one.)
 
-The honest state of it: the offsets are mostly landed. Wired to registered natives are varps and
-varbits, item containers, widgets (bounds, text and children), NPC/player names, and the world map's
-origin position; everything derivable from those is built and unit-tested — pathfinding, tile
-overlays, config, events, the right-click popup. None of it has been seen working in-game yet (no
-login has ever been attempted), and until `DO_ACTION` below is derived nothing here can actually act.
+The honest state of it (2026-09-06, logged in on client-240-6): the offsets are mostly landed.
+Wired to registered natives are varps and varbits, item containers, widgets (bounds, text and
+children), NPC/player names, and the world map's origin position; everything derivable from those
+is built and unit-tested — pathfinding, tile overlays, config, events, the right-click popup.
+
+**Seen live**, in a logged-in client: autologin end to end (Existing User click → backspaces →
+password → Login click → state 10 → 20 → 25 → 30 → the *click here to play* click); entity boxes and
+hull prisms sitting on the actual models at each entity's own render height; names over NPCs and
+players (`DEF_NAME` reads on this build — 10 of 11 nearby NPCs named, the eleventh is a nameless
+one); and Shortest Path end to end — shift+right-click → the kewl popup's **Set Target** → a 32-step
+path → red tiles on the ground, the minimap line and the debug panel. The game's own *Walk here* row
+sits under our Set Target row, so setting a target also walks you there.
+
+**Still unverified in-game:** NPC Indicators driven from a name list, profile switching, and the
+plugin hub. And `DO_ACTION` is still 0, so the shim's own action path cannot act (see below) — the
+walking above is the game's menu doing it, not us.
+
 What still returns an honest default through `net.runelite.api.ClientState`, each method naming the
 offset it is waiting for:
 

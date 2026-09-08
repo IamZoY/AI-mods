@@ -8,6 +8,10 @@ public class WorldEntities
 
 	public WorldEntity byIndex(int index)
 	{
+		ShimSupport.note("WorldEntities.byIndex", ShimSupport.Kind.NEEDS_OFFSET,
+			"reads null for every index, upstream's \"no such sub-world\": boats and other world"
+				+ " entities are not readable, so a path is always computed from the shore rather"
+				+ " than from a moving deck");
 		return null;
 	}
 }

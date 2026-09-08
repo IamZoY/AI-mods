@@ -71,6 +71,21 @@ public class SettingCodecTest
 	}
 
 	@Test
+	public void secretTextRoundTripsExactlyLikeText()
+	{
+		// A secret is a display concern only: the codec must treat it as the TEXT it is, so the value
+		// persists and comes back verbatim (including characters a masked field never showed).
+		ColourPlugin p = new ColourPlugin();
+		Setting s = p.config.secret("pw", "Password", "", "");
+		s.set("Qq7#with spaces and =signs");
+		Object encoded = SettingCodec.encode(s);
+		assertEquals("Qq7#with spaces and =signs", encoded);
+		assertEquals("Qq7#with spaces and =signs", SettingCodec.decode(s, encoded));
+		assertEquals("an empty secret persists as the empty string, not as nothing", "",
+				SettingCodec.encode(p.config.secret("pw2", "Password", "", "")));
+	}
+
+	@Test
 	public void storedStringsDecodeDirectly()
 	{
 		Setting s = colourSetting(Color.WHITE);

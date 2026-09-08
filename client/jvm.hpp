@@ -13,12 +13,17 @@
 // Every native below is a place that can crash the game, so the bar for adding one is: could the Java
 // side do this with what it already has? Nine is more than the four we started with, and each of the
 // extra five earned its place by removing a whole category of thing C++ would otherwise have to know
-// about -- what an NPC is, what a skill is, what a box looks like.
+// about -- what an NPC is, what a skill is, what a box looks like. The four input natives (postChar,
+// postKey, postMouse, inputTarget -- 2026-09-05) are the first that push something INTO the game
+// rather than read it; they exist because only the DLL knows the game's window handle and the Win32
+// lParam bit layout, and they are deliberately PostMessageW-only (see the section comment).
 #pragma once
 #include <windows.h>
 #include <jni.h>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <cwchar>
 #include <string>
 #include <vector>
 #include "game.hpp"
@@ -92,8 +97,11 @@ inline jboolean JNICALL nReady(JNIEnv*, jclass) {
     return clientObj() ? JNI_TRUE : JNI_FALSE;
 }
 
-/// Every visible entity, flattened, seven ints each:
-///     uid, sceneX, sceneY, isPlayer, typeId, animation, orientation
+/// Every visible entity, flattened, TEN ints each:
+///     uid, sceneX, sceneY, isPlayer, typeId, animation, orientation, fineX, fineH, fineY
+///
+/// The last three are the render position (offsets.hpp ENTITY_FINE_*): where the model is drawn, in
+/// fine units, height included -- the height is what puts a box on the entity instead of at datum 0.
 ///
 /// `typeId` is the NPC's type id; for players it is always -1 on this build -- PLAYER_COMBAT_LEVEL
 /// (offsets.hpp) is wrong here and reading it shipped pointer-fragment garbage as combat levels -- so
@@ -104,18 +112,24 @@ inline jboolean JNICALL nReady(JNIEnv*, jclass) {
 /// stutter you then spend an evening profiling. Java unpacks it into records once.
 inline jintArray JNICALL nEntities(JNIEnv* env, jclass) {
     std::vector<jint> flat;
-    flat.reserve(256 * 7);
+    flat.reserve(256 * 10);
     forEachEntity([&](const Entity& e) {
-        bool player = isPlayerUid(e.uid);
+        // The kind comes from the table the walker found the node in (Entity::player), not from a
+        // per-entity scan of PLAYER_IDS: that scan was (#entities x #players) VirtualQuery'd reads
+        // per frame -- tens of thousands in a crowd, enough to drag the overlay behind moving
+        // entities -- and it misclassified any NPC whose uid equalled a present player's handle.
         flat.push_back(e.uid);
         flat.push_back(e.sceneX);
         flat.push_back(e.sceneY);
-        flat.push_back(player ? 1 : 0);
+        flat.push_back(e.player ? 1 : 0);
         // -1 for players: combatLevel() is gated off because PLAYER_COMBAT_LEVEL is wrong on this
         // build (see offsets.hpp and game.hpp).
-        flat.push_back(player ? combatLevel(e.addr) : npcTypeId(e.addr));
+        flat.push_back(e.player ? combatLevel(e.addr) : npcTypeId(e.addr));
         flat.push_back(e.animation);
         flat.push_back(e.orientation);
+        flat.push_back(e.fineX);
+        flat.push_back(e.fineH);
+        flat.push_back(e.fineY);
     });
     jintArray arr = env->NewIntArray(static_cast<jsize>(flat.size()));
     if (arr && !flat.empty()) env->SetIntArrayRegion(arr, 0, static_cast<jsize>(flat.size()), flat.data());
@@ -136,10 +150,13 @@ inline jintArray JNICALL nLocal(JNIEnv* env, jclass) {
     bool found = false;
     Entity me = localPlayer(found);
     if (!found) return env->NewIntArray(0);
-    jint v[8] = { me.uid, me.sceneX, me.sceneY, me.plane,
-                  me.animation, me.orientation, runEnergy(), cycle() };
-    jintArray arr = env->NewIntArray(8);
-    if (arr) env->SetIntArrayRegion(arr, 0, 8, v);
+    // Eleven ints: the eight kewl.api.Local always had, then the render position {fineX, fineH,
+    // fineY} (see nEntities). Local.read() checks the length, so both sides move together.
+    jint v[11] = { me.uid, me.sceneX, me.sceneY, me.plane,
+                   me.animation, me.orientation, runEnergy(), cycle(),
+                   me.fineX, me.fineH, me.fineY };
+    jintArray arr = env->NewIntArray(11);
+    if (arr) env->SetIntArrayRegion(arr, 0, 11, v);
     return arr;
 }
 
@@ -217,35 +234,223 @@ inline jlong JNICALL nProject(JNIEnv*, jclass, jint fineX, jint fineHeight, jint
     // Off unless KEWL_LOG is set -- the same gate the launcher's input diagnostics print behind
     // (dllmain.cpp redirects stdout to the file it names). Unconditional here meant one line per
     // second in every session, which is noise nobody asked for. Once enabled, it MEASUREs the space
-    // instead of arguing about it: project your own tile and print it next to the canvas size, the
-    // camera ints the leaf subtracts, and the divide/multiply pair of its final rescale (offsets.hpp
-    // CAMERA_FINE_*, VIEW_*). Standing still, that point must land on your own character. When it
-    // does not, this one line says which space is wrong and by how much: cam values near
-    // sceneBase<<7 mean the camera is world-based and our scene-fine input is not (fix: project
-    // world fine coords); numerator != denominator means the leaf returns a scaled space, not canvas
-    // pixels (fix: the ratio is the correction). This is diagnosis for an offset that has never been
-    // verified in-game -- delete the probe once the boxes sit on the NPCs.
-    static int probe = 0;
+    // instead of arguing about it. What the first live run (2026-09-05) settled and what it left:
+    //
+    //   SETTLED: the camera ints are scene-fine (within a tile of the player's sceneX<<7), and the
+    //   leaf's final rescale is identity -- view= printed x1606/1606 y900/900 once the pairs were
+    //   read in the roles offsets.hpp gives them (the first version of this line paired +0x60 over
+    //   +0x5C, a height over a width, and read as a bogus 0.56 factor). No ratio correction belongs
+    //   anywhere in the projection path; if view= ever prints a non-1 ratio, THAT is the correction.
+    //
+    //   OPEN: whether the point lands on the character. The first version projected the tile's
+    //   SOUTH-WEST CORNER (sceneX<<7, no +64), which sits ~70 px off the centre at the logged depth
+    //   and so could not be judged; this one projects the CENTRE, like every real caller does.
+    //   And every caller projects at height 0, which is the client's height datum, not the ground
+    //   (game.hpp projectFine): the camera height moved ~50 units between three nearby spots at
+    //   fixed pitch/zoom, so the terrain is not at 0 everywhere. The h-sweep line projects the
+    //   centre at several candidate heights next to the current mouse position (canvas space, same
+    //   as nInput): hover your own feet and the h whose y matches the cursor IS the ground height
+    //   there. No offset for a tile-height reader is derived; this is how to size the residual.
+    //
+    //   Also printed: plane as game.hpp reads it plus the raw ints at entity+0x420 (ENTITY_PLANE,
+    //   SUSPECT) and +0x7CC (the decompile's candidate) -- read-only, so the offsets.hpp staircase
+    //   check (walk up a floor, see which one steps 0..3) can be done from the log; and the nearest
+    //   NPC's uid / def pointer / raw *(int*)def / name, so npcTypeId's unverified layout can be
+    //   checked against a known NPC (a Banker should read a small id and "Banker").
+    // This is diagnosis for offsets that have never been verified in-game -- delete the probe once
+    // the boxes sit on the NPCs.
+    // Throttled by WALL CLOCK, not by call count: nProject runs once per projected point, and a
+    // frame projects five points per NPC with tiles on, one per player, and 104x104 tiles on a
+    // right-click -- so "% 300" fired nearly every frame in a bank and 36 times in one right-click
+    // frame, each burst walking the registry twice on the frame thread (review, 2026-09-05).
+    static ULONGLONG lastBurst = 0;
     static bool probeEnabled = ::getenv("KEWL_LOG") != nullptr;
-    if (probeEnabled && (probe++ % 30) == 0) {
+    const ULONGLONG nowMs = GetTickCount64();
+    if (probeEnabled && nowMs - lastBurst >= 10000) {   // one burst per 10 s: a trace, not a firehose
+        lastBurst = nowMs;
         bool found = false;
         Entity me = localPlayer(found);
+        const int cx = found ? (me.sceneX << 7) + 64 : 0;   // tile CENTRE, like Game.projectTile
+        const int cy = found ? (me.sceneY << 7) + 64 : 0;
         float mx = 0.f, my = 0.f;
-        if (found && projectFine(me.sceneX << 7, 0, me.sceneY << 7, mx, my)) {
-            int camX = 0, camH = 0, camY = 0, bw = 0, bh = 0, vw = 0, vh = 0;
+        if (found && projectFine(cx, 0, cy, mx, my)) {
+            int camX = 0, camH = 0, camY = 0, inW = 0, inH = 0, outW = 0, outH = 0;
             std::uintptr_t c = clientObj();
             if (c) {
                 camX = rd<std::int32_t>(c + off::CAMERA_FINE_X);
                 camH = rd<std::int32_t>(c + off::CAMERA_FINE_H);
                 camY = rd<std::int32_t>(c + off::CAMERA_FINE_Y);
                 std::uintptr_t v10 = rdp(c + off::VIEW_OBJ) + off::VIEW_OBJ_SCALE_BASE;
-                bw = rd<std::int32_t>(v10 + off::VIEW_BASE_W);
-                bh = rd<std::int32_t>(v10 + off::VIEW_BASE_H);
-                vw = rd<std::int32_t>(v10 + off::VIEW_CANVAS_W);
-                vh = rd<std::int32_t>(v10 + off::VIEW_CANVAS_H);
+                inW  = rd<std::int32_t>(v10 + off::VIEW_IN_W);
+                inH  = rd<std::int32_t>(v10 + off::VIEW_IN_H);
+                outW = rd<std::int32_t>(v10 + off::VIEW_OUT_W);
+                outH = rd<std::int32_t>(v10 + off::VIEW_OUT_H);
             }
-            std::printf("[proj] you@scene(%d,%d) -> (%.1f,%.1f) canvas=%dx%d cam=(%d,%d,%d) view=(%d/%d, %d/%d)\n",
-                        me.sceneX, me.sceneY, mx, my, cwW, cwH, camX, camH, camY, vw, bw, vh, bh);
+            // Both raw plane candidates, unguarded, so the staircase check can be read off the log
+            // (game.hpp prefers ENTITY_PLANE_COORD when it is 0..3 -- `plane=` shows the winner).
+            const int raw420 = rd<std::int32_t>(me.addr + off::ENTITY_PLANE, -1);        // 0x420, SUSPECT
+            const int raw7CC = rd<std::int32_t>(me.addr + off::ENTITY_PLANE_COORD, -1);  // 0x7CC, decompile
+            kk::logf("[proj] you@scene(%d,%d) centre -> (%.1f,%.1f) canvas=%dx%d cam=(%d,%d,%d) "
+                     "cam-you=(%d,%d,%d) view=x%d/%d y%d/%d plane=%d raw420=%d raw7CC=%d\n",
+                     me.sceneX, me.sceneY, mx, my, cwW, cwH, camX, camH, camY,
+                     camX - cx, camH, camY - cy, outW, inW, outH, inH, me.plane, raw420, raw7CC);
+
+            // Height sweep at the centre, next to the mouse (canvas space, as nInput reports it).
+            POINT mp{ -1, -1 };
+            if (GetCursorPos(&mp)) ScreenToClient(cw, &mp);
+            char sweep[256];
+            int n = std::snprintf(sweep, sizeof sweep, "[proj] h-sweep mouse=(%ld,%ld)", mp.x, mp.y);
+            for (int h : { 0, -100, -200, -300, -400 }) {
+                float hx = 0.f, hy = 0.f;
+                if (n < static_cast<int>(sizeof sweep) && projectFine(cx, h, cy, hx, hy))
+                    n += std::snprintf(sweep + n, sizeof sweep - n, " h%d->(%.0f,%.0f)", h, hx, hy);
+            }
+            kk::logf("%s\n", sweep);
+
+            // Render-position candidates on the local player's own struct. Live 2026-09-05 the tile
+            // centre at datum height 0 drew ~290 canvas px below the character's feet, and the sweep
+            // put the ground there at about -390: the client positions its models from a heightmap
+            // this DLL cannot read yet. The entity struct must hold the model's own fine position to
+            // render it, so this scans the struct for ints/floats within a tile of the fine x and y
+            // we already trust (ENTITY_SCENE_X/Y << 7) and for plausible heights (-1500..-50). A triple
+            // (x, h, y) at neighbouring offsets is the render position; the height that tracks a
+            // staircase in the log is the offset to promote into offsets.hpp (NOT VERIFIED until
+            // then). Anchored on two distinctive known values, not a byte pattern; capped so one
+            // burst stays readable.
+            {
+                const int fx = (me.sceneX << 7) + 64, fy = (me.sceneY << 7) + 64;
+                char cand[1024];
+                int n2 = std::snprintf(cand, sizeof cand, "[proj] me@%p cands:", reinterpret_cast<void*>(me.addr));
+                int shown = 0;
+                for (std::uintptr_t o = 0; o < 0x1000 && shown < 40 && n2 < static_cast<int>(sizeof cand) - 40; o += 4) {
+                    const std::int32_t v = rd<std::int32_t>(me.addr + o, 0x7FFFFFFF);
+                    if (v == 0x7FFFFFFF) continue;
+                    float f; std::memcpy(&f, &v, 4);
+                    const bool fOk = f == f && f > -1.0e6f && f < 1.0e6f;
+                    const char* tag = nullptr; double val = 0;
+                    if (std::abs(v - fx) <= 128)                { tag = "xi"; val = v; }
+                    else if (std::abs(v - fy) <= 128)           { tag = "yi"; val = v; }
+                    else if (v >= -1500 && v <= -50)            { tag = "hi"; val = v; }
+                    else if (fOk && std::fabs(f - fx) <= 128.f) { tag = "xf"; val = f; }
+                    else if (fOk && std::fabs(f - fy) <= 128.f) { tag = "yf"; val = f; }
+                    else if (fOk && f >= -1500.f && f <= -50.f && std::fabs(f - std::floor(f)) < 0.001f) { tag = "hf"; val = f; }
+                    if (!tag) continue;
+                    n2 += std::snprintf(cand + n2, sizeof cand - n2, " +%llx:%s=%.0f",
+                                        static_cast<unsigned long long>(o), tag, val);
+                    ++shown;
+                }
+                kk::logf("%s%s\n", cand, shown >= 40 ? " ..." : "");
+            }
+
+            // Nearest NPC, for the typeId layout check. One extra registry walk per burst.
+            bool haveNpc = false;
+            Entity npc;
+            int best = 1 << 30;
+            forEachEntity([&](const Entity& e) {
+                if (e.player) return;
+                int d = std::abs(e.sceneX - me.sceneX) + std::abs(e.sceneY - me.sceneY);
+                if (d < best) { best = d; npc = e; haveNpc = true; }
+            });
+            if (haveNpc) {
+                std::uintptr_t def = rdp(npc.addr + off::ENTITY_DEF_PTR);
+                kk::logf("[proj] nearest npc uid=%d def=%p rawId=%d id=%d name=\"%s\" dist=%d\n",
+                         npc.uid, reinterpret_cast<void*>(def), def ? rd<std::int32_t>(def, -1) : -1,
+                         npcTypeId(npc.addr), npcName(npc.addr).c_str(), best);
+                // The two NxtStrings the name comes from, as raw bytes: the name read "" live on
+                // 2026-09-05 for an NPC with a valid id (6521), so DEF_NAME / ENTITY_NAME_OVERRIDE (or
+                // the inline/heap flag convention at +0x17) is what these 24+24 bytes are for judging.
+                auto dump = [](const char* what, std::uintptr_t at) {
+                    char line[256];
+                    int n = std::snprintf(line, sizeof line, "[proj]   %s @%p:", what, reinterpret_cast<void*>(at));
+                    for (int i = 0; i < 24 && n < static_cast<int>(sizeof line) - 4; ++i)
+                        n += std::snprintf(line + n, sizeof line - n, " %02x", rd<std::uint8_t>(at + i, 0));
+                    kk::logf("%s\n", line);
+                };
+                dump("override", npc.addr + off::ENTITY_NAME_OVERRIDE);
+                if (def) dump("def+name", def + off::DEF_NAME);
+                // Some NPCs read "" at def+DEF_NAME while most read fine (live 2026-09-06: ids 5885
+                // and 6521) -- the shape of a TRANSFORM npc, whose base definition is nameless and
+                // whose varbit-chosen child carries the name. The client must hold the resolved child
+                // somewhere to draw it; this scans the entity for 8-byte-aligned pointers to anything
+                // whose +DEF_NAME reads as printable text, and prints offset + name. A hit that is not
+                // ENTITY_DEF_PTR is the resolved-definition pointer to promote into offsets.hpp.
+                if (npcName(npc.addr).empty()) {
+                    char line[768];
+                    int n = std::snprintf(line, sizeof line, "[proj]   resolved-def cands:");
+                    int shown = 0;
+                    for (std::uintptr_t o = 0; o < 0x800 && shown < 10 && n < static_cast<int>(sizeof line) - 96; o += 8) {
+                        std::uintptr_t ptr = rdp(npc.addr + o);
+                        if (!ptr || ptr == def || !readable(ptr + off::DEF_NAME, 0x18)) continue;
+                        std::string nm = nxtString(ptr + off::DEF_NAME);
+                        if (nm.size() < 3 || nm.size() > 40) continue;
+                        bool print = true;
+                        for (unsigned char ch : nm) if (ch < 0x20 || ch > 0x7E) { print = false; break; }
+                        if (!print) continue;
+                        n += std::snprintf(line + n, sizeof line - n, " +%llx->\"%s\"(id %d)",
+                                           static_cast<unsigned long long>(o), nm.c_str(), rd<std::int32_t>(ptr, -1));
+                        ++shown;
+                    }
+                    kk::logf("%s\n", line);
+                    // Nothing on the entity: the transform must be resolved through the DEFINITION.
+                    // Walk the base def for pointers to other named defs (direct children) and for
+                    // pointers to arrays of such pointers (a child table), printing offset -> name(id).
+                    // The varbit/varp that picks among them is the next thing to find once the table's
+                    // offset is known; until then a nameless base with children can at least show one.
+                    if (def) {
+                        char l2[1024];
+                        int n2 = std::snprintf(l2, sizeof l2, "[proj]   def child cands:");
+                        int shown2 = 0;
+                        auto named = [&](std::uintptr_t ptr, std::string& out) -> bool {
+                            if (!ptr || ptr == def || !readable(ptr + off::DEF_NAME, 0x18)) return false;
+                            out = nxtString(ptr + off::DEF_NAME);
+                            if (out.size() < 3 || out.size() > 40) return false;
+                            for (unsigned char ch : out) if (ch < 0x20 || ch > 0x7E) return false;
+                            return true;
+                        };
+                        for (std::uintptr_t o = 0; o < 0x400 && shown2 < 12 && n2 < static_cast<int>(sizeof l2) - 120; o += 8) {
+                            std::uintptr_t ptr = rdp(def + o);
+                            std::string nm;
+                            if (named(ptr, nm)) {
+                                n2 += std::snprintf(l2 + n2, sizeof l2 - n2, " +%llx->%s(%d)",
+                                                    static_cast<unsigned long long>(o), nm.c_str(), rd<std::int32_t>(ptr, -1));
+                                ++shown2;
+                            } else if (ptr && readable(ptr, 0x40)) {
+                                // one level down: an array of pointers?
+                                for (int k = 0; k < 8 && shown2 < 12; ++k) {
+                                    std::uintptr_t pk = rdp(ptr + k * 8);
+                                    if (named(pk, nm)) {
+                                        n2 += std::snprintf(l2 + n2, sizeof l2 - n2, " +%llx[%d]->%s(%d)",
+                                                            static_cast<unsigned long long>(o), k, nm.c_str(), rd<std::int32_t>(pk, -1));
+                                        ++shown2;
+                                    }
+                                }
+                            }
+                        }
+                        kk::logf("%s\n", l2);
+                    }
+                }
+                // DEF_NAME (+0x8) read an EMPTY inline string live for NPC 6521 (2026-09-05), so the
+                // name lives elsewhere on this build's definition. Scan the definition for anything
+                // shaped like an NxtString holding printable text -- inline (flag byte at +0x17 <=
+                // 0x17, text at +0) or heap (flag & 0x80, pointer at +0, length at +8) -- and print
+                // the offset and text. The one that reads the NPC's real name is DEF_NAME.
+                if (def) {
+                    char line[1024];
+                    int n = std::snprintf(line, sizeof line, "[proj]   def strings:");
+                    int shown = 0;
+                    for (std::uintptr_t o = 0; o < 0x400 && shown < 12 && n < static_cast<int>(sizeof line) - 80; o += 8) {
+                        std::string s = nxtString(def + o);
+                        if (s.size() < 3 || s.size() > 60) continue;
+                        bool print = true;
+                        for (unsigned char ch : s) if (ch < 0x20 || ch > 0x7E) { print = false; break; }
+                        if (!print) continue;
+                        n += std::snprintf(line + n, sizeof line - n, " +%llx=\"%s\"",
+                                           static_cast<unsigned long long>(o), s.c_str());
+                        ++shown;
+                    }
+                    kk::logf("%s\n", line);
+                }
+            }
             std::fflush(stdout);
         }
     }
@@ -341,6 +546,62 @@ inline void JNICALL nPresentPanel(JNIEnv* env, jclass, jintArray px, jint w, jin
 /// costs: keys typed into the game's chat also show up here (Java filters nothing, hotkeys can fire
 /// while you type -- matching RuneLite without its focus widget is a later problem), and the scan is
 /// per-frame global state, so a press is seen by whichever frame runs next, ~33ms later at worst.
+// ---------------------------------------------------------------------------------------------------
+// Button-press LATCH. nInput samples GetAsyncKeyState once per overlay frame (~33 ms), so a click that
+// is pressed AND released between two samples -- a fast human right-click, or any synthetic one -- was
+// never seen at all: the shim's popup (kewl.rl.MenuPopup) keys off the up->down edge and simply did
+// not open (live 2026-09-06: a shift+right-click reached the game's own menu and nothing of ours).
+// A WH_MOUSE hook on the game's window thread sees every WM_xBUTTONDOWN the game itself receives, so
+// it records "pressed since the last snapshot" plus the shift state AT the press -- the popup needs
+// shift as it was when the user clicked, not 30 ms later. Read-and-cleared by nInput. The hook is
+// in-process (we are a DLL in the game), does nothing but one atomic store, and always calls on.
+// ---------------------------------------------------------------------------------------------------
+// The right button's latch carries its shift state IN THE SAME WORD: bit0 = pressed since the last
+// snapshot, bit1 = shift was held AT that press. Two separate atomics could not be read as a pair --
+// nInput exchanged the latch and then loaded the shift flag, so a plain right-click landing between
+// the hook's two stores was reported with the PREVIOUS click's shift ("Set target" offered on a click
+// that never held shift). One store, one exchange, no window (review 2026-09-06).
+constexpr int RB_PRESSED = 1 << 0;
+constexpr int RB_SHIFT   = 1 << 1;
+inline std::atomic<int> g_lbLatch{0}, g_rbLatch{0};
+inline HHOOK g_mouseHook = nullptr;
+inline DWORD g_mouseHookTid = 0;      // the thread g_mouseHook is on; NXT can move the window to another
+
+inline LRESULT CALLBACK mouseLatchHook(int code, WPARAM w, LPARAM l) {
+    if (code >= 0) {
+        if (w == WM_LBUTTONDOWN) g_lbLatch.store(1);
+        else if (w == WM_RBUTTONDOWN) {
+            g_rbLatch.store(RB_PRESSED | ((GetKeyState(VK_SHIFT) & 0x8000) ? RB_SHIFT : 0));
+            // Every latched right press, with the message that caused it: an ordinary LEFT click was
+            // seen opening the right-click popup live (2026-09-06), and this line is what says whether
+            // the hook is mislabelling a message or something downstream invents the press.
+            kk::logf("[input] latch: RBUTTONDOWN (msg 0x%x)\n", static_cast<unsigned>(w));
+        }
+    }
+    return CallNextHookEx(g_mouseHook, code, w, l);
+}
+
+/// Install the latch hook on the thread that owns `gameWindow`. hMod is NULL on purpose: a thread
+/// hook whose procedure lives in the current process must pass NULL (SetWindowsHookEx docs).
+inline void installMouseLatch(HWND gameWindow) {
+    if (!gameWindow || !IsWindow(gameWindow)) return;
+    DWORD tid = GetWindowThreadProcessId(gameWindow, nullptr);
+    if (!tid) return;
+    // A WH_MOUSE hook is per THREAD. When NXT recreates its window during boot the new one can belong
+    // to a different thread, and the old hook then latches nothing -- the right-click popup would stop
+    // opening for the rest of the session (review 2026-09-06, introduced with the recreation fix).
+    // Same thread: keep what we have. Different thread: move the hook.
+    if (g_mouseHook) {
+        if (tid == g_mouseHookTid) return;
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
+    }
+    g_mouseHookTid = tid;
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE, mouseLatchHook, nullptr, tid);
+    kk::logf("[input] mouse latch hook %s (thread %lu)\n", g_mouseHook ? "installed" : "FAILED",
+             static_cast<unsigned long>(tid));
+}
+
 inline jintArray JNICALL nInput(JNIEnv* env, jclass) {
     jint v[8 + 16];
     int n = 8;
@@ -355,11 +616,18 @@ inline jintArray JNICALL nInput(JNIEnv* env, jclass) {
             v[1] = p.y;
         }
     }
-    v[2] = (GetAsyncKeyState(VK_SHIFT) & 0x8000)   ? 1 : 0;
+    // Held right now, OR pressed since the last snapshot (the latch above): a press shorter than a
+    // frame still shows as down for exactly one snapshot, which is the edge the popup needs. Shift
+    // is reported as it was AT the right-click when the latch fires, so a quick shift+right-click
+    // reaches the plugins as shift-held even if shift was let go before this sample.
+    const int lbLatched = g_lbLatch.exchange(0);
+    const int rbState   = g_rbLatch.exchange(0);          // pressed + shift-at-press in one read
+    const int rbLatched = (rbState & RB_PRESSED) != 0;
+    v[2] = ((GetAsyncKeyState(VK_SHIFT) & 0x8000) || (rbState & RB_SHIFT)) ? 1 : 0;
     v[3] = (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? 1 : 0;
     v[4] = (GetAsyncKeyState(VK_MENU) & 0x8000)    ? 1 : 0;
-    v[5] = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0;
-    v[6] = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ? 1 : 0;
+    v[5] = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) || lbLatched) ? 1 : 0;
+    v[6] = ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) || rbLatched) ? 1 : 0;
     v[7] = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? 1 : 0;
 
     // Edge detection against last frame. 0x08-0xFF are the keys (the buttons are the fixed fields
@@ -378,6 +646,143 @@ inline jintArray JNICALL nInput(JNIEnv* env, jclass) {
     return arr;
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Input INTO the game (2026-09-05, NOT yet exercised live -- kewl.plugins.AutoLogin is the first user).
+//
+// Everything here is PostMessageW to NXT's JagRenderView child, nothing else. Why that and not
+// SendInput: SendInput is delivered to whatever window is FOREGROUND and focused. Our queues are
+// attached to the game's (dllmain attachInput), so normally that is the game -- but if the user has
+// alt-tabbed to another application while autologin is typing, SendInput would type the PASSWORD
+// into that application. PostMessageW is targeted at one hwnd, thread-agnostic, never blocks (it
+// fails only for an invalid hwnd or a full message queue) and needs no focus at all.
+//
+// Why text goes as WM_CHAR and never as WM_KEYDOWN: a read-only import scan of osclient.exe
+// (client-240-6, 2026-09-05) shows TranslateMessage/DispatchMessage/GetMessage/PeekMessage imported
+// and NO RegisterRawInputDevices/GetRawInputData/ToUnicode/GetKeyboardState/MapVirtualKey/VkKeyScan/
+// SendInput -- NXT reads typed text as the WM_CHAR its own TranslateMessage produces, so a posted
+// WM_CHAR lands in the same handler as real typing. A posted WM_KEYDOWN for a letter would be
+// TranslateMessage'd using the thread's PHYSICAL shift/caps state (posted key messages do not touch
+// the key-state table), giving the wrong case for a mixed-case password, AND it would emit a second
+// WM_CHAR, doubling every character. Tab/Enter/Backspace DO go as WM_KEYDOWN/WM_KEYUP: that is
+// exactly the real sequence, and NXT's TranslateMessage supplies the tab/return/backspace WM_CHAR
+// itself.
+//
+// Posted messages never show up in GetAsyncKeyState, so nothing injected here can feed back into
+// pollKeys/nInput hotkeys. The one open risk: NXT imports GetAsyncKeyState (purpose unknown); if it
+// validates mouse clicks against physical button state, posted clicks are ignored. The autologin
+// script therefore defaults to Tab rather than clicks, and the live log shows whether state moved.
+// A SendInput fallback is deliberately NOT here; if one is ever added it must check
+// GetForegroundWindow() root == GetAncestor(target, GA_ROOT) && GetFocus() == target immediately
+// before EVERY call and abort the whole attempt otherwise.
+// ---------------------------------------------------------------------------------------------------
+
+/// The window that receives injected input: the JagRenderView child (NXT's keyboard/mouse window,
+/// the one dllmain SetFocus()es), falling back to the game root. Logged once per change of target so
+/// the live log proves which window the messages went to.
+inline HWND inputTarget() {
+    HWND t = canvasWindow();
+    if (!(t && t != g_gameWindow)) {
+        HWND rv = g_gameWindow ? FindWindowExW(g_gameWindow, nullptr, L"JagRenderView", nullptr) : nullptr;
+        t = rv ? rv : g_gameWindow;
+    }
+    static HWND logged = nullptr;
+    if (t != logged) {
+        logged = t;
+        wchar_t cls[64] = L"";
+        if (t && IsWindow(t)) GetClassNameW(t, cls, 64);
+        kk::logf("[input] target %p class=%ls\n", static_cast<void*>(t), cls);
+    }
+    return t;
+}
+
+/// WM_KEYDOWN / WM_KEYUP lParam as the keyboard driver would build it: repeat count 1, scan code in
+/// bits 16-23; for the up message also bit 30 (previous state down) and bit 31 (transition).
+inline LPARAM keyLParam(UINT vk, bool down) {
+    UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    LPARAM l = 1 | static_cast<LPARAM>(scan & 0xFF) << 16;
+    if (!down) l |= (static_cast<LPARAM>(1) << 30) | (static_cast<LPARAM>(1) << 31);
+    return l;
+}
+
+/// Post one UTF-16 code unit as WM_CHAR. Text goes as WM_CHAR and never as WM_KEYDOWN: NXT's own
+/// TranslateMessage would derive the case from the PHYSICAL shift/caps state and emit a second
+/// WM_CHAR (osclient.exe imports TranslateMessage and no ToUnicode/GetKeyboardState -- import scan
+/// 2026-09-05). Logs nothing about the character: this is the password path. Earns its place in the
+/// unsafe surface because only the DLL knows the target hwnd and the lParam scan-code bits.
+inline jboolean JNICALL nPostChar(JNIEnv*, jclass, jint ch) {
+    HWND t = inputTarget();
+    if (!t || !IsWindow(t)) return JNI_FALSE;
+    SHORT vks = VkKeyScanW(static_cast<WCHAR>(ch));
+    UINT scan = vks == -1 ? 0 : MapVirtualKeyW(LOBYTE(vks), MAPVK_VK_TO_VSC);
+    LPARAM l = 1 | static_cast<LPARAM>(scan & 0xFF) << 16;
+    return PostMessageW(t, WM_CHAR, static_cast<WPARAM>(ch), l) ? JNI_TRUE : JNI_FALSE;
+}
+
+/// Post WM_KEYDOWN (down) or WM_KEYUP (up) for a virtual key.
+///
+/// Tab and Backspace go as the bare key pair: live 2026-09-06 that alone moved between the login
+/// fields and erased text, so NXT's own TranslateMessage is supplying their WM_CHAR and a second one
+/// from us would Tab twice (back to the field we left). Enter and Escape did NOT act the same night
+/// (the form never submitted: state stayed 10 with both fields typed), so for those two the WM_CHAR
+/// ('\r' / 0x1B) is posted explicitly between down and up -- a duplicate Enter can only re-submit
+/// the same form, a duplicate Escape only re-cancel. Which of the two the form actually listens to
+/// is what the next live run tells.
+inline jboolean JNICALL nPostKey(JNIEnv*, jclass, jint vk, jboolean down) {
+    HWND t = inputTarget();
+    if (!t || !IsWindow(t)) return JNI_FALSE;
+    bool d = down != JNI_FALSE;
+    BOOL ok = PostMessageW(t, d ? WM_KEYDOWN : WM_KEYUP, static_cast<WPARAM>(vk),
+                           keyLParam(static_cast<UINT>(vk), d));
+    if (ok && d && (vk == VK_RETURN || vk == VK_ESCAPE))
+        PostMessageW(t, WM_CHAR, static_cast<WPARAM>(vk == VK_RETURN ? L'\r' : 0x1B),
+                     keyLParam(static_cast<UINT>(vk), true));
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/// Mouse in CANVAS client coordinates (the space nInput/nViewport measure -- the same window, so no
+/// conversion). action 0 move, 1 left down, 2 left up. Java sequences move -> down -> (next tick) up.
+inline jboolean JNICALL nPostMouse(JNIEnv*, jclass, jint x, jint y, jint action) {
+    HWND t = inputTarget();
+    if (!t || !IsWindow(t)) return JNI_FALSE;
+    LPARAM l = MAKELPARAM(x, y);
+    switch (action) {
+        case 0: return PostMessageW(t, WM_MOUSEMOVE, 0, l) ? JNI_TRUE : JNI_FALSE;
+        case 1: return PostMessageW(t, WM_LBUTTONDOWN, MK_LBUTTON, l) ? JNI_TRUE : JNI_FALSE;
+        case 2: return PostMessageW(t, WM_LBUTTONUP, 0, l) ? JNI_TRUE : JNI_FALSE;
+        default: return JNI_FALSE;
+    }
+}
+
+/// {targetExists, targetIsRenderView, focusIsTarget, gameIsForeground, canvasW, canvasH}. With grab,
+/// SetFocus(target) first -- guarded by a 50 ms WM_NULL SendMessageTimeoutW probe, because a
+/// cross-thread SetFocus over the attached queues hangs while NXT is not pumping (launcher gamePumps).
+/// Diagnosis only: the posted-message path needs no focus; this is what the status line reports.
+inline jintArray JNICALL nInputTarget(JNIEnv* env, jclass, jboolean grab) {
+    HWND t = inputTarget();
+    jint v[6] = {0, 0, 0, 0, 0, 0};
+    if (t && IsWindow(t)) {
+        wchar_t cls[32] = L"";
+        GetClassNameW(t, cls, 32);
+        v[0] = 1;
+        v[1] = wcscmp(cls, L"JagRenderView") == 0 ? 1 : 0;
+        if (grab) {
+            DWORD_PTR ign = 0;
+            if (SendMessageTimeoutW(t, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 50, &ign)) SetFocus(t);
+            else kk::logf("[input] game not pumping -- focus grab skipped\n");
+        }
+        v[2] = GetFocus() == t ? 1 : 0;
+        HWND fg = GetForegroundWindow();
+        v[3] = fg && GetAncestor(fg, GA_ROOT) == GetAncestor(t, GA_ROOT) ? 1 : 0;
+        RECT r{};
+        GetClientRect(t, &r);
+        v[4] = r.right - r.left;
+        v[5] = r.bottom - r.top;
+    }
+    jintArray arr = env->NewIntArray(6);
+    if (arr) env->SetIntArrayRegion(arr, 0, 6, v);
+    return arr;
+}
+
 /// The client's own state machine -- 10 title, 20 logging in, 25 loading, 30 logged in. This is the
 /// field the game itself branches on (offsets.hpp GAME_STATE), so the shim's GameStateChanged events
 /// fire on real transitions instead of a synthesised login sequence. 0 before the client object exists.
@@ -385,14 +790,324 @@ inline jint JNICALL nGameState(JNIEnv*, jclass) {
     return gameState();
 }
 
-/// An entity's name by uid: player names come off the heap NxtString at entity+0x718, NPC names off
-/// the definition's +0x8 (offsets.hpp; both VERIFIED LIVE in the GE). "" when it despawned or the read
-/// failed -- a name is cosmetic, it never blocks anything.
-inline jstring JNICALL nEntityName(JNIEnv* env, jclass, jint uid) {
+
+/// Find where the client keeps a string we already know the value of, so a field can be located
+/// without a decompiler: walk this process's committed read/write regions and return the addresses
+/// whose bytes equal `needle` (Latin-1, the client's own encoding for these fields).
+///
+/// This is DIAGNOSIS, not a feature: it is how the login username's field was located live, and the
+/// password field is its neighbour on the same object. It never returns or logs the bytes -- only
+/// addresses -- so a caller may pass a secret and print the result. Capped at 64 hits and skipped
+/// entirely for a needle under 3 bytes, which would match everywhere.
+inline jlongArray JNICALL nFindString(JNIEnv* env, jclass, jstring needle) {
+    std::vector<jlong> hits;
+    if (needle) {
+        const char* utf = env->GetStringUTFChars(needle, nullptr);
+        if (utf) {
+            std::string pat(utf);
+            env->ReleaseStringUTFChars(needle, utf);
+            if (pat.size() >= 3 && pat.size() <= 128) {
+                SYSTEM_INFO si{};
+                GetSystemInfo(&si);
+                auto addr = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
+                const auto maxAddr = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
+                MEMORY_BASIC_INFORMATION mbi{};
+                while (addr < maxAddr && hits.size() < 64 && VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi)) {
+                    const DWORD prot = mbi.Protect & 0xFF;
+                    const bool rw = (mbi.State == MEM_COMMIT)
+                                 && (prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE)
+                                 && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+                    if (rw && mbi.RegionSize <= (256u << 20)) {
+                        const auto* base = reinterpret_cast<const char*>(mbi.BaseAddress);
+                        const std::size_t n = static_cast<std::size_t>(mbi.RegionSize);
+                        for (std::size_t i = 0; i + pat.size() <= n && hits.size() < 64; ++i) {
+                            if (base[i] == pat[0] && std::memcmp(base + i, pat.data(), pat.size()) == 0)
+                                hits.push_back(static_cast<jlong>(reinterpret_cast<std::uintptr_t>(base + i)));
+                        }
+                    }
+                    addr = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                }
+            }
+        }
+    }
+    jlongArray arr = env->NewLongArray(static_cast<jsize>(hits.size()));
+    if (arr && !hits.empty()) env->SetLongArrayRegion(arr, 0, static_cast<jsize>(hits.size()), hits.data());
+    return arr;
+}
+
+/// Bytes at an address, as a hex line, for identifying what a nFindString hit sits inside. Read
+/// through the same guarded reader as every other native, so a bad address is "" and not a crash.
+/// Never called with an address the client did not give us.
+inline jstring JNICALL nPeek(JNIEnv* env, jclass, jlong at, jint len) {
+    std::string out;
+    const auto a = static_cast<std::uintptr_t>(at);
+    const int n = (len < 1) ? 1 : (len > 64 ? 64 : len);
+    if (a && readable(a, static_cast<std::size_t>(n))) {
+        char b[4];
+        for (int i = 0; i < n; ++i) {
+            std::snprintf(b, sizeof b, "%02x", rd<std::uint8_t>(a + i, 0));
+            out += b;
+        }
+    }
+    return env->NewStringUTF(out.c_str());
+}
+
+/// Write one NUL-terminated login field. THE ONLY WRITE INTO GAME MEMORY IN THIS DLL.
+///
+/// The address comes from nFindString -- i.e. from a pattern match, not from a derived offset chain --
+/// so it could be anything: another process object, our own JVM heap, a page that merely happens to
+/// contain the same bytes. A wrong write there is a corrupted client at best and a corrupted JVM heap
+/// at worst. So this refuses on every doubt and writes nothing:
+///
+///   1. cap in 1..256, a non-empty value that fits inside it (and no longer than 128 bytes).
+///   2. The whole cap window is readable, through the same guarded reader as every other native.
+///   3. The region is MEM_COMMIT and PAGE_READWRITE / PAGE_EXECUTE_READWRITE, with no guard page, and
+///      the window does not run off the end of it. There is deliberately NO VirtualProtect: a buffer
+///      that is not already writable is not the client's form, it is a mistake.
+///   4. The bytes already there are either ALL ZERO (the empty password field -- the "Please enter
+///      your password" state this exists for) or exactly `value` (the username field, which is how
+///      the address was found in the first place; that write is a no-op that proves the address).
+///   5. The value plus its terminator fits in the existing content plus the run of zeroes after it,
+///      which is the only part of the buffer we have any evidence is ours to touch.
+///   6. The buffer is not shaped like an inline NxtString (flag byte at +0x17 holding 0x17 - length).
+///      Those carry their length in that byte and writing the text without it renders the OLD length;
+///      this will not guess, it refuses and says so. The candidate pair found live is 508 bytes apart
+///      with binary padding between, which is a fixed-buffer struct and not two 24-byte NxtStrings,
+///      so this gate is a tripwire rather than the normal path.
+///
+/// It never logs the value, its length, or any byte of the buffer -- only the verdict.
+///
+/// Returns 0 on success; -1 bad argument, -2 not readable, -3 not writable, -4 unexpected content,
+/// -5 no room, -6 inline NxtString.
+inline jint JNICALL nSetLoginField(JNIEnv* env, jclass, jlong at, jstring value, jint cap) {
+    if (!value || cap < 1 || cap > 256) return -1;
+    const char* utf = env->GetStringUTFChars(value, nullptr);
+    if (!utf) return -1;
+    std::string v(utf);
+    env->ReleaseStringUTFChars(value, utf);
+    if (v.empty() || v.size() > 128 || static_cast<jint>(v.size()) + 1 > cap) return -1;
+
+    const auto a = static_cast<std::uintptr_t>(at);
+    const std::size_t window = static_cast<std::size_t>(cap);
+    if (!kk::readable(a, window)) return -2;
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi)) return -3;
+    const DWORD prot = mbi.Protect & 0xFF;
+    if (mbi.State != MEM_COMMIT) return -3;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return -3;
+    if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE) return -3;
+    if (a + window > reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) return -3;
+
+    auto* buf = reinterpret_cast<char*>(a);
+    std::size_t existing = 0;
+    while (existing < window && buf[existing] != '\0') ++existing;
+    if (existing == window) return -4;                       // no terminator inside cap: not a field
+    if (existing != 0 && (existing != v.size() || std::memcmp(buf, v.data(), v.size()) != 0)) return -4;
+
+    std::size_t zeros = 0;
+    while (existing + zeros < window && buf[existing + zeros] == '\0') ++zeros;
+    const std::size_t room = existing + zeros;               // all we have any right to write over
+    if (v.size() + 1 > room) return -5;
+
+    // The NxtString tripwire: an inline one keeps 0x17 - length in the byte at +0x17, and that byte
+    // has to move with the text. Only meaningful when it is inside the window we checked.
+    constexpr std::size_t NXT_FLAG = 0x17;
+    if (NXT_FLAG < window && existing <= NXT_FLAG
+        && static_cast<unsigned char>(buf[NXT_FLAG]) == static_cast<unsigned char>(NXT_FLAG - existing)) {
+        return -6;
+    }
+
+    std::memcpy(buf, v.data(), v.size());
+    buf[v.size()] = '\0';
+    kk::logf("[loginfield] wrote a field at %p (verified writable, buffer was %s)\n",
+             reinterpret_cast<void*>(a), existing == 0 ? "empty" : "already this value");
+    return 0;
+}
+
+/// Bytes read out of the game, as a jstring, without ever handing JNI malformed modified-UTF-8
+/// (NewStringUTF's contract; a stray high byte there is undefined behaviour in the VM). The client's
+/// string encoding is NOT VERIFIED: offsets.hpp records that names are padded with U+00A0, which is
+/// a lone 0xA0 byte if the strings are Latin-1 and C2 A0 if they are UTF-8. So: if the bytes are
+/// valid UTF-8 they go through NewStringUTF unchanged; otherwise each byte is widened as Latin-1 and
+/// the string is built from UTF-16 with NewString, which is exact for a single-byte encoding.
+inline jstring gameBytesToJString(JNIEnv* env, const std::string& s) {
+    if (s.empty()) return env->NewStringUTF("");
+    bool utf8 = true;
+    for (std::size_t i = 0; i < s.size() && utf8;) {
+        unsigned char b = static_cast<unsigned char>(s[i]);
+        // No 4-byte leads: NewStringUTF speaks MODIFIED UTF-8, where supplementary characters are
+        // two 3-byte surrogates and a 4-byte form is malformed -- so those take the Latin-1 path.
+        int extra = b < 0x80 ? 0 : (b & 0xE0) == 0xC0 ? 1 : (b & 0xF0) == 0xE0 ? 2 : -1;
+        if (extra < 0 || i + static_cast<std::size_t>(extra) >= s.size()) { utf8 = false; break; }
+        for (int k = 1; k <= extra; ++k)
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) { utf8 = false; break; }
+        i += extra + 1;
+    }
+    if (utf8) return env->NewStringUTF(s.c_str());
+    std::vector<jchar> wide(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) wide[i] = static_cast<jchar>(static_cast<unsigned char>(s[i]));
+    return env->NewString(wide.data(), static_cast<jsize>(wide.size()));
+}
+
+
+/// Every loaded interface component that carries text, as "group:component x,y w,h hidden text" lines.
+///
+/// This is how a plugin finds a button by its LABEL instead of by a pixel offset somebody measured on
+/// one window size: "CLICK HERE TO PLAY" is a component, and its id is stable where a coordinate is
+/// not. The walk is the same one widget() does (offsets.hpp: manager -> group array -> componentData),
+/// just over every group rather than one id.
+///
+/// Capped at `max` lines and 32 KB. Called from a probe, not per frame: it walks the whole interface
+/// tree. Text goes through the same Latin-1/UTF-8 path as every other string the natives return.
+inline jstring JNICALL nDumpWidgetText(JNIEnv* env, jclass, jint max) {
+    std::string out;
+    int lines = 0;
+    const int cap = (max < 1) ? 1 : (max > 4096 ? 4096 : max);
+    std::uintptr_t c = clientObj();
+    std::uintptr_t mgr = c ? rdp(c + off::IFACE_MANAGER) : 0;
+    if (mgr) {
+        const std::uint64_t gcount = rd<std::uint64_t>(mgr + off::IFACE_GROUP_COUNT);
+        const std::uintptr_t garr = rdp(mgr + off::IFACE_GROUP_ARRAY);
+        if (garr && gcount > 0 && gcount <= 0x1000) {
+            for (std::uint64_t g = 0; g < gcount && lines < cap && out.size() < 32768; ++g) {
+                const std::uintptr_t entry = garr + g * off::IFACE_GROUP_ENTRY_STRIDE;
+                const std::uintptr_t data = rdp(entry + off::IFACE_GROUP_ENTRY_DATA);
+                if (!data) continue;
+                std::uint64_t ccount = rd<std::uint64_t>(entry + off::IFACE_GROUP_ENTRY_COUNT);
+                if (ccount > 4096) ccount = 4096;
+                for (std::uint64_t i = 0; i < ccount && lines < cap && out.size() < 32768; ++i) {
+                    // +8: the component pointer sits in the SECOND half of the 16-byte shared_ptr
+                    // entry, exactly as widgetObj() reads it. Reading +0 hands back the control block,
+                    // and every component then measures 1x1 -- which is what made this walk report
+                    // that the whole rectangle block was wrong (it is not; the walk was).
+                    const std::uintptr_t w = rdp(data + i * 16 + 8);
+                    if (!w || w == rdp(moduleBase() + off::IFACE_EMPTY_SENTINEL + 8)) continue;
+                    std::string text = nxtString(w + off::IFTYPE_TEXT);
+                    bool printable = !text.empty();
+                    for (unsigned char ch : text) if (ch < 0x20 || ch > 0x7E) { printable = false; break; }
+                    if (!printable || text.size() > 80) text.clear();
+                    // A button can be a SPRITE with no text at all -- "CLICK HERE TO PLAY" is one
+                    // (live 2026-09-06: the welcome screen has groups loaded and not one component
+                    // carries text). So report every component that has a real rectangle and let the
+                    // caller find the one whose rect contains a point it already knows works.
+                    const int ww = rd<std::int32_t>(w + off::IFTYPE_WIDTH);
+                    const int wh = rd<std::int32_t>(w + off::IFTYPE_HEIGHT);
+                    if (ww <= 0 || wh <= 0 || ww > 4096 || wh > 4096) continue;
+                    if (text.empty()) text = "-";
+                    // x,y are CANVAS coordinates wherever the parent chain resolves, and the stored
+                    // parent-relative pair only where it does not (widgetAbs falls back to exactly what
+                    // widget() has always returned, and says so through `complete`). That one change is
+                    // what makes kewl.api.Widgets.smallestContaining work at all: it matches a point
+                    // that is known good on the canvas against these rectangles, and against relative
+                    // ones no component ever contained the point -- its own doc predicted that failure.
+                    // The LINE FORMAT is deliberately untouched; kewl.api.Widgets.parseLine reads it and
+                    // is covered by tests.
+                    const WidgetAbs abs = widgetAbs(static_cast<int>((g << 16) | i));
+                    char line[256];
+                    std::snprintf(line, sizeof line, "%llu:%llu %d,%d %dx%d %s %s\n",
+                                  static_cast<unsigned long long>(g), static_cast<unsigned long long>(i),
+                                  abs.x, abs.y,
+                                  ww, wh,
+                                  rd<std::uint8_t>(w + off::IFTYPE_HIDDEN) ? "hidden" : "shown", text.c_str());
+                    out += line;
+                    ++lines;
+                }
+            }
+        }
+    }
+    return gameBytesToJString(env, out);
+}
+
+/// Which addresses inside the CLIENT OBJECT's first `span` bytes point at (or just before) `target`.
+///
+/// The discriminator a plain value scan cannot give: a string the game renders is reachable from the
+/// client object, while an identical copy in the JVM heap is not. A hit here says "this buffer belongs
+/// to a client structure, at this offset", which is exactly what goes in offsets.hpp. Read-only, and
+/// it returns offsets, never bytes.
+inline jintArray JNICALL nPointersTo(JNIEnv* env, jclass, jlong target, jint span, jint slack) {
+    std::vector<jint> offs;
+    const auto t = static_cast<std::uintptr_t>(target);
+    const std::uintptr_t c = clientObj();
+    const int n = (span < 8) ? 8 : (span > (1 << 20) ? (1 << 20) : span);
+    const int s = (slack < 0) ? 0 : (slack > 4096 ? 4096 : slack);
+    if (c && t) {
+        for (int o = 0; o + 8 <= n && offs.size() < 64; o += 8) {
+            const std::uintptr_t p = rdp(c + o);
+            if (p && p <= t && t - p <= static_cast<std::uintptr_t>(s)) offs.push_back(o);
+        }
+    }
+    jintArray arr = env->NewIntArray(static_cast<jsize>(offs.size()));
+    if (arr && !offs.empty()) env->SetIntArrayRegion(arr, 0, static_cast<jsize>(offs.size()), offs.data());
+    return arr;
+}
+
+
+/// Where a component stores a rectangle: scan every loaded component's struct for two ints equal to
+/// `w` and `h` (the canvas size, which a top-level interface matches) and report the offsets found.
+///
+/// STALE PREMISE, kept because the tool is still useful: this says it exists because IFTYPE_WIDTH/
+/// HEIGHT "read 1 for every component". That claim was RETRACTED the same day it was made -- the probe
+/// behind it had read the 16-byte shared_ptr entry at +0 (the control block) instead of +8 (the object),
+/// and the rectangle block at 0x5C..0x68 is fine. What was actually wrong was that x/y are
+/// PARENT-RELATIVE, which is now handled by widgetAbs, not by a different rect offset. The method here
+/// -- "look for a value you already know" -- is still how an unknown offset gets derived without a
+/// decompiler, so this stays; it is just no longer looking for something that is missing.
+inline jstring JNICALL nFindWidgetRect(JNIEnv* env, jclass, jint w, jint h) {
+    std::string out;
+    int found = 0;
+    std::uintptr_t c = clientObj();
+    std::uintptr_t mgr = c ? rdp(c + off::IFACE_MANAGER) : 0;
+    if (mgr) {
+        const std::uint64_t gcount = rd<std::uint64_t>(mgr + off::IFACE_GROUP_COUNT);
+        const std::uintptr_t garr = rdp(mgr + off::IFACE_GROUP_ARRAY);
+        if (garr && gcount > 0 && gcount <= 0x1000) {
+            for (std::uint64_t g = 0; g < gcount && found < 24; ++g) {
+                const std::uintptr_t entry = garr + g * off::IFACE_GROUP_ENTRY_STRIDE;
+                const std::uintptr_t data = rdp(entry + off::IFACE_GROUP_ENTRY_DATA);
+                if (!data) continue;
+                std::uint64_t ccount = rd<std::uint64_t>(entry + off::IFACE_GROUP_ENTRY_COUNT);
+                if (ccount > 4096) ccount = 4096;
+                for (std::uint64_t i = 0; i < ccount && found < 24; ++i) {
+                    const std::uintptr_t comp = rdp(data + i * 16 + 8);   // +8: see nDumpWidgetText
+                    if (!comp || comp == rdp(moduleBase() + off::IFACE_EMPTY_SENTINEL + 8)) continue;
+                    // Look for w at some offset with h nearby (the usual {x,y,w,h} or {w,h} layout).
+                    for (std::uintptr_t o = 0; o + 8 <= 0x400; o += 4) {
+                        if (rd<std::int32_t>(comp + o, -1) != w) continue;
+                        for (int d : { 4, 8, -4, 12 }) {
+                            if (rd<std::int32_t>(comp + o + d, -1) != h) continue;
+                            char line[160];
+                            std::snprintf(line, sizeof line, "%llu:%llu w@+%llx h@+%llx\n",
+                                          static_cast<unsigned long long>(g),
+                                          static_cast<unsigned long long>(i),
+                                          static_cast<unsigned long long>(o),
+                                          static_cast<unsigned long long>(o + d));
+                            out += line;
+                            ++found;
+                            break;
+                        }
+                        if (found >= 24) break;
+                    }
+                }
+            }
+        }
+    }
+    if (out.empty()) out = "(no component holds the canvas size -- try again while an interface is open)\n";
+    return gameBytesToJString(env, out);
+}
+
+/// An entity's name by uid AND kind: player names come off the heap NxtString at entity+0x718, NPC
+/// names off the definition's +0x8 (offsets.hpp). The kind is an argument because the uid alone is
+/// ambiguous -- players and NPCs live in separate tables with separate keyspaces (game.hpp
+/// findEntity). "" when it despawned or the read failed -- a name is cosmetic, it never blocks
+/// anything. NOTE the name read itself was never exercised in-game before 2026-09-05 (the NxtString
+/// flag byte was read from the wrong address -- game.hpp nxtString); the offsets are live-verified,
+/// this function's output is not yet.
+inline jstring JNICALL nEntityName(JNIEnv* env, jclass, jint uid, jboolean player) {
     bool found = false;
-    Entity e = findEntity(uid, found);
-    std::string name = found ? (isPlayerUid(uid) ? playerName(e.addr) : npcName(e.addr)) : std::string{};
-    return env->NewStringUTF(name.c_str());
+    Entity e = findEntity(uid, player == JNI_TRUE, found);
+    std::string name = found ? (e.player ? playerName(e.addr) : npcName(e.addr)) : std::string{};
+    return gameBytesToJString(env, name);
 }
 
 /// One widget's state: {ok, x, y, width, height, hidden}, or empty when the id is not loaded right
@@ -411,7 +1126,7 @@ inline jintArray JNICALL nWidget(JNIEnv* env, jclass, jint id) {
 /// net.runelite.client.util.Text strips them where a plugin wants that). "" when not loaded.
 inline jstring JNICALL nWidgetText(JNIEnv* env, jclass, jint id) {
     Widget w = widget(id);
-    return env->NewStringUTF(w.text.c_str());
+    return gameBytesToJString(env, w.text);
 }
 
 /// A widget's dynamic child by index: {ok, x, y, width, height, hidden}, or empty when out of range.
@@ -433,6 +1148,44 @@ inline jintArray JNICALL nWidgetChild(JNIEnv* env, jclass, jint id, jint childIn
     return arr;
 }
 
+
+/// A widget's rectangle in CANVAS coordinates: {ok, absX, absY, width, height, hidden, depth,
+/// complete}, or empty when the id is not loaded.
+///
+/// `complete` is the one field a caller must branch on. It is 1 only when the parent chain was walked
+/// all the way to a root, which is the only case where absX/absY are a canvas position; when it is 0
+/// the pair is the component's own PARENT-RELATIVE x/y -- identical to what widget() returns -- and
+/// Java must refuse rather than draw at it. See game.hpp widgetAbs and the THE PARENT LINK block in
+/// offsets.hpp for why the link this walks is derived at runtime instead of being a constant.
+inline jintArray JNICALL nWidgetAbs(JNIEnv* env, jclass, jint id) {
+    WidgetAbs a = widgetAbs(id);
+    if (!a.ok) return env->NewIntArray(0);
+    jint v[8] = { 1, a.x, a.y, a.w, a.h, a.hidden ? 1 : 0, a.depth, a.complete ? 1 : 0 };
+    jintArray arr = env->NewIntArray(8);
+    if (arr) env->SetIntArrayRegion(arr, 0, 8, v);
+    return arr;
+}
+
+/// The parent chain behind one widgetAbs answer, as a line a human can check in one look. Diagnostic:
+/// called once a session under KEWL_LOG, never per frame. The last hop is the self-test -- a group
+/// root must read (0,0) at exactly the canvas size, and that says whether IFTYPE_X/Y are the laid-out
+/// rect (this whole approach) or the cache originals (a much bigger job) without measuring anything by
+/// eye.
+inline jstring JNICALL nWidgetChain(JNIEnv* env, jclass, jint id) {
+    return gameBytesToJString(env, widgetChainString(id));
+}
+
+/// Re-derive the parent link from scratch and return the tally, counts and all.
+///
+/// This is the evidence behind every absolute rectangle in the shim: which offset holds
+/// (group<<16)|comp on every component (the positive control), which holds a same-group parent id or
+/// a same-group parent pointer, how many survived the acyclic-forest check, and -- free while the
+/// group's pointer set is in hand -- whether IFTYPE_CHILDREN_* carries the static tree or only what
+/// cc_create spawned. Walks every loaded component's first 0x400 bytes twice, so call it from a probe,
+/// at most once a session, never per frame.
+inline jstring JNICALL nWidgetTreeProbe(JNIEnv* env, jclass) {
+    return gameBytesToJString(env, widgetLink(true).report);
+}
 /// The world map's state: {level, originX, originZ, centreX, centreZ}, or empty when the map object
 /// does not exist yet. The origin is the map's own coordinate base in world tiles (MapCoord at
 /// wm+0x54B8, VERIFIED LIVE). The centre ints are the map centre in 8-world-tile units
@@ -567,14 +1320,23 @@ inline bool startJvm(const std::wstring& javaHome, const std::wstring& jarPath, 
     // collector calls NetworkInterface regardless of the source, and Wine's GetAdaptersAddresses
     // fails. The fix is on the Java side: kewl.WineRandomProvider, inserted before any plugin loads.
 
-    JavaVMOption opt[2]{};
-    opt[0].optionString = cp.data();
-    opt[1].optionString = headless.data();
+    std::vector<std::string> optStrings{ cp, headless };
+    // With KEWL_LOG set, a JVM crash report lands next to the log instead of in the game's working
+    // directory, where nobody looks for it. Java's own System.out/err already go to the log: log.hpp
+    // installed the file as the process's standard handles before we got here.
+    if (const char* log = ::getenv("KEWL_LOG")) {
+        std::string dir(log);
+        auto cut = dir.find_last_of("\\/");
+        dir = cut == std::string::npos ? "." : dir.substr(0, cut);
+        optStrings.push_back("-XX:ErrorFile=" + dir + "\\kewl_hs_err_%p.log");
+    }
+    std::vector<JavaVMOption> opt(optStrings.size());
+    for (std::size_t i = 0; i < optStrings.size(); ++i) opt[i].optionString = optStrings[i].data();
 
     JavaVMInitArgs args{};
     args.version = JNI_VERSION_1_8;
-    args.nOptions = 2;
-    args.options = opt;
+    args.nOptions = static_cast<jint>(opt.size());
+    args.options = opt.data();
     args.ignoreUnrecognized = JNI_FALSE;
 
     JNIEnv* env = nullptr;
@@ -603,12 +1365,27 @@ inline bool startJvm(const std::wstring& javaHome, const std::wstring& jarPath, 
         { const_cast<char*>("present"),     const_cast<char*>("([III)V"), reinterpret_cast<void*>(nPresent) },
         { const_cast<char*>("presentPanel"),const_cast<char*>("([III)V"), reinterpret_cast<void*>(nPresentPanel) },
         { const_cast<char*>("gameState"),   const_cast<char*>("()I"),     reinterpret_cast<void*>(nGameState) },
-        { const_cast<char*>("entityName"),  const_cast<char*>("(I)Ljava/lang/String;"), reinterpret_cast<void*>(nEntityName) },
+        { const_cast<char*>("entityName"),  const_cast<char*>("(IZ)Ljava/lang/String;"), reinterpret_cast<void*>(nEntityName) },
         { const_cast<char*>("widget"),      const_cast<char*>("(I)[I"),   reinterpret_cast<void*>(nWidget) },
         { const_cast<char*>("widgetText"),  const_cast<char*>("(I)Ljava/lang/String;"), reinterpret_cast<void*>(nWidgetText) },
         { const_cast<char*>("widgetChild"), const_cast<char*>("(II)[I"),  reinterpret_cast<void*>(nWidgetChild) },
+        { const_cast<char*>("widgetAbs"),   const_cast<char*>("(I)[I"),   reinterpret_cast<void*>(nWidgetAbs) },
+        { const_cast<char*>("widgetChain"), const_cast<char*>("(I)Ljava/lang/String;"), reinterpret_cast<void*>(nWidgetChain) },
+        { const_cast<char*>("widgetTreeProbe"), const_cast<char*>("()Ljava/lang/String;"), reinterpret_cast<void*>(nWidgetTreeProbe) },
         { const_cast<char*>("worldMap"),    const_cast<char*>("()[I"),    reinterpret_cast<void*>(nWorldMap) },
         { const_cast<char*>("loadedGroups"),const_cast<char*>("()[I"),    reinterpret_cast<void*>(nLoadedGroups) },
+        { const_cast<char*>("findString"),  const_cast<char*>("(Ljava/lang/String;)[J"), reinterpret_cast<void*>(nFindString) },
+        { const_cast<char*>("peek"),        const_cast<char*>("(JI)Ljava/lang/String;"), reinterpret_cast<void*>(nPeek) },
+        { const_cast<char*>("dumpWidgetText"), const_cast<char*>("(I)Ljava/lang/String;"), reinterpret_cast<void*>(nDumpWidgetText) },
+        { const_cast<char*>("pointersTo"),  const_cast<char*>("(JII)[I"), reinterpret_cast<void*>(nPointersTo) },
+        { const_cast<char*>("findWidgetRect"), const_cast<char*>("(II)Ljava/lang/String;"), reinterpret_cast<void*>(nFindWidgetRect) },
+        // The one write into game memory; every gate is in nSetLoginField's comment.
+        { const_cast<char*>("setLoginField"), const_cast<char*>("(JLjava/lang/String;I)I"), reinterpret_cast<void*>(nSetLoginField) },
+        // Input into the game -- see the "Input INTO the game" section above nGameState.
+        { const_cast<char*>("postChar"),    const_cast<char*>("(I)Z"),    reinterpret_cast<void*>(nPostChar) },
+        { const_cast<char*>("postKey"),     const_cast<char*>("(IZ)Z"),   reinterpret_cast<void*>(nPostKey) },
+        { const_cast<char*>("postMouse"),   const_cast<char*>("(III)Z"),  reinterpret_cast<void*>(nPostMouse) },
+        { const_cast<char*>("inputTarget"), const_cast<char*>("(Z)[I"),   reinterpret_cast<void*>(nInputTarget) },
     };
     if (env->RegisterNatives(g_nat, natives, sizeof(natives) / sizeof(natives[0])) != JNI_OK) { err = "RegisterNatives failed"; return false; }
 
@@ -827,7 +1604,7 @@ inline bool bridgeApply(std::int32_t kind, std::int32_t pluginIdx, const char* k
         const unsigned bit = (kind >= 0 && kind < 31) ? (1u << kind) : (1u << 31);
         if (!(g_bridgeKindsLogged & bit)) {
             g_bridgeKindsLogged |= bit;
-            std::printf("[bridge] edit kind %d has no Java method on this jar -- dropped\n", kind);
+            kk::logf("[bridge] edit kind %d has no Java method on this jar -- dropped\n", kind);
             std::fflush(stdout);
         }
         return true;
@@ -881,7 +1658,7 @@ inline bool bridgeApply(std::int32_t kind, std::int32_t pluginIdx, const char* k
     // line naming it, then clear, and the edit is CONSUMED either way: re-delivering a record Java
     // has rejected would wedge the ring on it and every edit behind it.
     if (e->ExceptionCheck()) {
-        std::printf("[bridge] edit kind %d threw %s (cleared)\n", kind, exceptionName(e).c_str());
+        kk::logf("[bridge] edit kind %d threw %s (cleared)\n", kind, exceptionName(e).c_str());
         std::fflush(stdout);
         e->ExceptionClear();
     }

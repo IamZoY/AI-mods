@@ -19,7 +19,10 @@
 //   * the mutex guards the MODEL REGION only -- the edit ring is a single-producer/single-consumer
 //     ring the DLL reads with plain loads, so the launcher publishes a record and THEN bumps head,
 //     and never blocks the DLL's publish path on an edit write;
-//   * the ring indices are monotonically increasing, live slot = index % RING_SLOTS;
+//   * the ring indices are monotonically increasing, live slot = index % RING_SLOTS, and a FULL ring
+//     is RING_SLOTS - 1 pending records: the launcher refuses to write at that point because the DLL
+//     treats head - tail == RING_SLOTS as a lapped ring and drops the whole backlog (review
+//     2026-09-06 -- filling to exactly 64 delivered nothing, not 64 edits);
 //   * the model region starts at sizeof(Header) and is bounded by the mapping, which the DLL
 //     created at MAPPING_BYTES (32 MB).
 #pragma once
@@ -74,8 +77,20 @@ enum SettingKind : std::int32_t {
     SET_TEXT    = 5,
 };
 
+// Plugin flags: the int32 that follows `enabled` in every plugin record. bit0 is the field's
+// original "hasConfig 0/1" meaning, unchanged, which is why the developer bit needed no format bump
+// -- same field, same offset, spare bits. bit1 is kewl.Plugin.developer(): smoke tests and worked
+// examples, which the plugin list sorts last under a "Developer" heading. Same constants in
+// client/bridge.hpp (PLUGIN_FLAG_*) and kewl.panel.PanelBridge (PLUGIN_FLAG_CONFIG / _DEV).
+constexpr std::int32_t PLUGIN_FLAG_CONFIG = 1 << 0;
+constexpr std::int32_t PLUGIN_FLAG_DEV    = 1 << 1;
+
 constexpr std::int32_t FLAG_KEYBIND  = 1 << 0;
 constexpr std::int32_t FLAG_HASUNITS = 1 << 1;
+// A SET_TEXT whose value is a secret (a password): the strip edits it in a password-mode field and
+// never draws it in clear anywhere. valueText carries the real value regardless -- the masking is
+// this side's job, so the field can round-trip an edit.
+constexpr std::int32_t FLAG_SECRET   = 1 << 2;
 
 // Hub entry flags and the hub's overall state (int32 fields in the model region's hub block).
 constexpr std::int32_t HUB_FLAG_INSTALLED  = 1 << 0;
@@ -136,7 +151,9 @@ constexpr std::size_t MODEL_OFFSET  = sizeof(Header);      // 13360
 static_assert(MODEL_OFFSET == 13360, "bridge contract (client/bridge.hpp): the model region starts at 13360");
 
 // Field widths in the model region -- the packed byte stream the DLL writes under the mutex.
-// client/bridge.hpp::buildModel is the writer; the order there is the order here.
+// client/bridge.hpp::buildModel is the writer; the order there is the order here. The plugin record
+// itself is int32 enabled, int32 flags (PLUGIN_FLAG_* above), int32 hotkey, then the three char
+// fields below and the setting count.
 namespace model {
 constexpr std::size_t PLUGIN_NAME   = 64;
 constexpr std::size_t PLUGIN_DESC   = 160;

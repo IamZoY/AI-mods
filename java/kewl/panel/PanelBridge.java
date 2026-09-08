@@ -40,7 +40,12 @@ import net.runelite.client.config.Keybind;
  *   FORMAT (2)                    bumped when any layout below changes
  *   pluginCount
  *   per plugin:
- *     enabled (0/1), hasConfig (0/1), hotkey (-1..7)
+ *     enabled (0/1), flags, hotkey (-1..7)
+ *                   flags bit0 = has settings (this int WAS "hasConfig 0/1" and bit0 still is
+ *                   exactly that, which is why the developer bit could be added without a FORMAT
+ *                   bump -- the field's width, offset and old meaning are unchanged),
+ *                   bit1 = developer scaffolding (kewl.Plugin.developer(): the panel groups these
+ *                   under a "Developer" heading, sorted after everything else)
  *     str name (63)  str description (159)  str status (159)
  *     settingCount
  *     per setting:
@@ -51,7 +56,10 @@ import net.runelite.client.config.Keybind;
  *       min, max    INT bounds; 0 for everything else
  *       enumIndex   index into options of the current value (0 when unknown), 0 for non-enums
  *       optionCount capped at 8
- *       flags       bit0 = keybind, bit1 = the value display carries a @Units suffix
+ *       flags       bit0 = keybind, bit1 = the value display carries a @Units suffix,
+ *                   bit2 = secret (a TEXT setting the launcher must edit in a password field and
+ *                   never draw in clear; valueText still carries the value, because the field
+ *                   has to be able to show and edit it -- the MASKING is the launcher's job)
  *       str key (63)  str label (95)  str description (191)
  *       str section (63)   the SECTION HEADER's display name, "" when the setting sits loose above
  *                          the sections -- the launcher draws grouping from it
@@ -99,6 +107,22 @@ public final class PanelBridge {
 
     /** Bumped when the packed layout changes; the DLL refuses a snapshot whose FORMAT it does not know. */
     public static final int FORMAT = 2;
+
+    /** Setting flag bit2: a secret TEXT setting -- see the layout comment. Bits 0/1 are packed inline. */
+    public static final int FLAG_SECRET = 1 << 2;
+
+    /**
+     * Per-plugin flags word, the int the layout comment above once called "hasConfig".
+     *
+     * <p>Bit0 keeps that exact meaning, so the format did not have to move: every reader that tested
+     * the old int for non-zero still sees a configurable plugin as non-zero, and the field is the
+     * same width at the same offset. Bit1 is the developer mark. Mirrored on the C++ side as
+     * {@code PLUGIN_FLAG_CONFIG} / {@code PLUGIN_FLAG_DEV} in {@code launcher/bridge_layout.hpp}.</p>
+     */
+    public static final int PLUGIN_FLAG_CONFIG = 1 << 0;
+
+    /** @see #PLUGIN_FLAG_CONFIG */
+    public static final int PLUGIN_FLAG_DEV = 1 << 1;
 
     /**
      * The most settings one plugin's record carries. Must match {@code MAX_SETTINGS_PER_PLUGIN} in
@@ -353,6 +377,22 @@ public final class PanelBridge {
     private static final int HUB_IDLE = 0;
 
     /**
+     * One plugin's flags word. {@code developer()} is plugin code like {@code status()} is, so it is
+     * guarded the same way -- a plugin that throws here would otherwise tear the whole snapshot and
+     * freeze every tab (the activeProfileIndex-of-1.7-billion failure, 2026-09-06). Not developer is
+     * the honest fallback: the plugin still shows, in the main list.
+     */
+    private static int pluginFlags(Plugin p) {
+        int flags = p.config.isEmpty() ? 0 : PLUGIN_FLAG_CONFIG;
+        try {
+            if (p.developer()) flags |= PLUGIN_FLAG_DEV;
+        } catch (Throwable t) {
+            System.out.println("[panel-bridge] plugin \"" + p.name() + "\" developer() threw: " + t);
+        }
+        return flags;
+    }
+
+    /**
      * One plugin's record, or a placeholder that keeps the record COUNT -- and therefore the plugin
      * INDEXES -- intact when the walk over that plugin throws. The launcher's edits name plugins by
      * index into the registry, so a record silently dropped from the middle would make every later
@@ -371,7 +411,7 @@ public final class PanelBridge {
             }
             System.out.println("[panel-bridge] plugin \"" + name + "\" threw while being read: " + t);
             b.put(0);                                        // enabled: unknowable, so off
-            b.put(0);                                        // hasConfig
+            b.put(0);                                        // flags: no settings, not developer
             b.put(-1);                                       // hotkey: unbound
             b.putString(name, 63);
             b.putString("could not be read: " + t, 159);
@@ -382,11 +422,17 @@ public final class PanelBridge {
 
     private static void plugin(Buf b, Plugin p) {
         b.put(p.isEnabled() ? 1 : 0);
-        b.put(p.config.isEmpty() ? 0 : 1);
+        b.put(pluginFlags(p));
         b.put(p.hotkey());
         b.putString(p.name(), 63);
         b.putString(p.description(), 159);
-        b.putString(p.status(), 159);
+        // A plugin's status() is plugin code: if it throws mid-record the snapshot is torn from here
+        // on and the launcher's reader lands on garbage (seen 2026-09-06 as an activeProfileIndex
+        // of 1.7 billion when a status line hit a native that was not loaded). An empty status is
+        // the honest fallback; the exception is the plugin's to fix, not the bridge's to propagate.
+        String status;
+        try { status = p.status(); } catch (Throwable t) { status = ""; }
+        b.putString(status == null ? "" : status, 159);
 
         // Metadata comes from the same walk the Java panel draws from, so the two panels can never
         // disagree about what is a keybind, what carries units, or which section a setting sits in.
@@ -427,7 +473,7 @@ public final class PanelBridge {
         b.put(s.max());
         b.put(index);
         b.put(optionCount);
-        b.put((keybind ? 1 : 0) | (units.isEmpty() ? 0 : 2));
+        b.put((keybind ? 1 : 0) | (units.isEmpty() ? 0 : 2) | (s.secret() ? FLAG_SECRET : 0));
         b.putString(s.key(), 63);
         b.putString(s.label(), 95);
         b.putString(s.description(), 191);

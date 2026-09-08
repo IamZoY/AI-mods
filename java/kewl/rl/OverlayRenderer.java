@@ -2,7 +2,13 @@
 //
 // Layering collapses: the layered window is above everything the game draws, so UNDER_WIDGETS and
 // ABOVE_SCENE end up in the same pass no matter what we do. The values still order overlays relative
-// to each other, and OverlayPanel positions pile up per corner so two panels do not overlap.
+// to each other.
+//
+// Placement follows upstream RuneLite's snap-corner model: an overlay whose position names a corner
+// is moved by its OWN size (measured on the previous frame and recorded in Overlay.getBounds) so its
+// right edge meets the right margin and its bottom edge meets the bottom margin, then the corner's
+// cursor advances -- down from the top corners, UP from the bottom ones. Overlays whose position is
+// DYNAMIC/MOUSE/TOOLTIP/STATE_OVERLAY draw in their own coordinates and are never translated.
 //
 // After the plugin overlay pass a WorldMapPoint marker pass runs: plugins push markers into a
 // WorldMapPointManager (Shortest Path's target marker is the only user), and nothing else renders
@@ -27,10 +33,10 @@ import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
+import net.runelite.api.worldmap.WorldMap;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.client.ui.overlay.OverlayPanel;
 import net.runelite.client.ui.overlay.OverlayPosition;
 import net.runelite.client.ui.overlay.worldmap.WorldMapPoint;
 import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
@@ -50,10 +56,18 @@ final class OverlayRenderer
 		List<Overlay> overlays = new ArrayList<>(manager.getOverlays());
 		overlays.sort(ORDER);
 
+		// The canvas rectangle overlays are anchored to. g.getClipBounds() is always
+		// (0, 0, canvasWidth, canvasHeight) here: KewlKlient.render() creates the Graphics2D from a
+		// BufferedImage sized to Natives.viewport() -- the game's client area, the same space the
+		// projection natives and postMouse work in -- and a BufferedImage's Graphics2D always carries
+		// the image bounds as its clip. If it is ever null we simply have no canvas rectangle, and an
+		// empty one degrades to the origin; inventing RuneLite's fixed-mode 765x503 viewport (which
+		// this canvas is not) would put every corner-anchored panel in the wrong place instead.
 		Rectangle clipped = g.getClipBounds();
-		final Rectangle bounds = clipped == null ? new Rectangle(0, 0, 765, 503) : clipped;
+		final Rectangle bounds = clipped == null ? new Rectangle() : clipped;
 
-		// Per-position running offset so panels stacking in one corner do not overlap.
+		// Per-position running cursor so panels stacking in one corner do not overlap. It grows DOWN
+		// from the top corners and UP from the bottom ones.
 		Map<OverlayPosition, Point> cursors = new EnumMap<>(OverlayPosition.class);
 
 		for (Overlay o : overlays)
@@ -61,14 +75,28 @@ final class OverlayRenderer
 			Graphics2D og = (Graphics2D) g.create();
 			try
 			{
-				if (o instanceof OverlayPanel)
+				final OverlayPosition position = o.getPosition();
+				if (isCornerAnchored(position))
 				{
-					Point at = cursors.computeIfAbsent(o.getPosition(), p -> baseAt(p, bounds));
-					og.translate(at.x, at.y);
+					Point cursor = cursors.computeIfAbsent(position, p -> anchorFor(p, bounds));
+
+					// The size this overlay had LAST frame (or its explicit preferred size). Right-
+					// and bottom-anchored overlays must be moved by their own width/height before
+					// they are drawn, and nothing can know that height before the draw: OverlayPanel
+					// empties its panel's children on the way out of render, so a measuring pre-pass
+					// here would just draw an empty panel. Upstream RuneLite solves it the same way.
+					Dimension size = o.getPreferredSize() != null
+						? o.getPreferredSize() : o.getBounds().getSize();
+					Point where = placeAt(position, cursor, size);
+					og.translate(where.x, where.y);
+
 					Dimension d = o.render(og);
-					if (d != null)
+					// Upstream's !bounds.isEmpty(): a panel that added no rows this frame returns
+					// (0, 0) and must neither record a size nor consume a slot's padding.
+					if (d != null && d.width > 0 && d.height > 0)
 					{
-						at.y += d.height + 6;
+						o.getBounds().setSize(d);
+						advance(position, cursor, d.height);
 					}
 				}
 				else
@@ -89,15 +117,29 @@ final class OverlayRenderer
 		renderWorldMapPoints(g);
 	}
 
+	/** Last reason the world-map marker pass stood down; keyed on the text so each is said once. */
+	private static String loggedMapMarkerRefusal = "";
+
 	/**
 	 * The WorldMapPoint markers plugins added. Two surfaces:
 	 *
-	 * World map: drawn only when the map centre data is live (WorldMap.isLive) -- a gate the plugin's
-	 * own map overlays do NOT share (they draw whenever the map widget is open, per WorldMap's
-	 * header), so a marker can be absent while the path drawing is up. Drawing a marker against a
-	 * stale centre would put the target somewhere the user did not pick. The pixel mapping mirrors
-	 * ShortestPathPlugin.mapWorldPointToGraphicsPointX/Y (RuneLite's own world-map-overlay maths,
-	 * anchored on the map centre and the MAP_CONTAINER bounds).
+	 * World map: gated on {@link WorldMap#refusalFor}, the SAME predicate PathMapOverlay, the
+	 * map-click resolver and the map menu entries use. It used to gate on "the container widget is
+	 * non-null and the centre is live", which is three conditions short and every one of them draws
+	 * something wrong rather than nothing:
+	 * <ul>
+	 *   <li>no isHidden() test -- the world-map GROUP STAYS LOADED WHILE THE MAP IS CLOSED on this
+	 *       build, so a non-null container is not an open map and this pass painted markers over the
+	 *       SCENE whenever a target was set;</li>
+	 *   <li>no isCanvasAbsolute() test -- the container's stored x/y are parent-relative until the
+	 *       chain resolves, so both the marker positions AND {@code mg.setClip(rect)} were taken from
+	 *       a rectangle that is not where the map is. Clipping to a wrong rectangle is the failure
+	 *       that painted the world map solid black;</li>
+	 *   <li>no isZoomCalibrated() test -- the placeholder 4.0 px/tile scales every marker's distance
+	 *       from the centre.</li>
+	 * </ul>
+	 * The pixel mapping mirrors ShortestPathPlugin.mapWorldPointToGraphicsPointX/Y (RuneLite's own
+	 * world-map-overlay maths, anchored on the map centre and the MAP_CONTAINER bounds).
 	 *
 	 * Minimap: the same Perspective.localToMinimap projection PathMinimapOverlay uses, clipped to the
 	 * minimap draw widget's ellipse.
@@ -121,7 +163,8 @@ final class OverlayRenderer
 		}
 
 		Widget map = client.getWidget(InterfaceID.Worldmap.MAP_CONTAINER);
-		if (map != null && client.getWorldMap().isLive())
+		String mapRefusal = WorldMap.refusalFor(map, client.getWorldMap());
+		if (mapRefusal == null)
 		{
 			Rectangle rect = map.getBounds();
 			net.runelite.api.Point centre = client.getWorldMap().getWorldMapPosition();
@@ -154,6 +197,16 @@ final class OverlayRenderer
 				mg.drawImage(image, x - image.getWidth() / 2, y - image.getHeight() / 2, null);
 			}
 			mg.dispose();
+		}
+		else if (!mapRefusal.equals(loggedMapMarkerRefusal))
+		{
+			// Keyed on the text, exactly as PathMapOverlay does it: a session moves from "not loaded"
+			// to "closed" to "no scale", and each distinct reason is worth saying once. Silence here
+			// would read as "the marker feature is broken" rather than "the map geometry is not
+			// trusted yet", which is a different fix.
+			loggedMapMarkerRefusal = mapRefusal;
+			System.out.println("[overlay] world-map markers stay OFF: " + mapRefusal
+				+ ". Minimap markers are unaffected.");
 		}
 
 		// Minimap: the same projection PathMinimapOverlay uses (which rotates with the camera and
@@ -192,19 +245,135 @@ final class OverlayRenderer
 		mng.dispose();
 	}
 
-	/** Where a panel in {@code position} starts drawing, and in which direction the stack grows. */
-	private static Point baseAt(OverlayPosition position, Rectangle bounds)
+	/** Margin between a corner-anchored overlay and the canvas edge. */
+	static final int BORDER = 5;
+
+	/** Top margin. Larger than BORDER so a top-anchored panel clears the game's own top furniture. */
+	static final int BORDER_TOP = 20;
+
+	/** Gap between two overlays stacked in the same corner. */
+	static final int PADDING = 3;
+
+	/**
+	 * UNVERIFIED. Height reserved above the bottom edge for the chatbox, used only by
+	 * ABOVE_CHATBOX_RIGHT. It is a guess, not a measurement: the chatbox widget's own rectangle
+	 * cannot be trusted while widget x/y are parent-relative (see the project's ground truth), so
+	 * there is nothing live to derive it from. No overlay in this tree uses that position today.
+	 */
+	static final int CHATBOX_HEIGHT = 165;
+
+	/**
+	 * Whether {@code position} pins an overlay to a canvas corner. Routing is by POSITION, as upstream
+	 * does it, not by whether the overlay happens to be an OverlayPanel: DYNAMIC/MOUSE/TOOLTIP/
+	 * STATE_OVERLAY overlays draw in their own coordinates (all four shortest-path map and tile
+	 * overlays are DYNAMIC) and must not be translated.
+	 */
+	static boolean isCornerAnchored(OverlayPosition position)
 	{
 		switch (position)
 		{
-			case TOP_LEFT: return new Point(8, 8);
-			case TOP_CENTER: return new Point(bounds.x + (bounds.width - 145) / 2, 8);
-			case TOP_RIGHT: return new Point(bounds.x + bounds.width - 160, 8);
-			case BOTTOM_LEFT: return new Point(8, bounds.y + bounds.height - 200);
-			case BOTTOM_RIGHT: return new Point(bounds.x + bounds.width - 160, bounds.y + bounds.height - 200);
-			case ABOVE_CHATBOX_RIGHT: return new Point(bounds.x + bounds.width - 160, 8);
-			default: return new Point(8, 8);
+			case DYNAMIC:
+			case MOUSE:
+			case TOOLTIP:
+			case STATE_OVERLAY:
+				return false;
+			default:
+				return true;
 		}
+	}
+
+	/** Bottom-anchored stacks grow away from the edge they are pinned to, i.e. upward. */
+	static boolean growsUpward(OverlayPosition position)
+	{
+		switch (position)
+		{
+			case BOTTOM_LEFT:
+			case BOTTOM_CENTER:
+			case BOTTOM_RIGHT:
+			case ABOVE_CHATBOX_RIGHT:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * The anchor point of {@code position} on {@code bounds}: the canvas corner the stack starts from,
+	 * BEFORE the overlay's own size is taken off it (see {@link #transformPosition}). Every case
+	 * honours bounds.x/bounds.y so a non-zero canvas origin would still work.
+	 */
+	static Point anchorFor(OverlayPosition position, Rectangle bounds)
+	{
+		final int left = bounds.x + BORDER;
+		final int right = bounds.x + bounds.width - BORDER;
+		final int centre = bounds.x + bounds.width / 2;
+		final int top = bounds.y + BORDER_TOP;
+		final int bottom = bounds.y + bounds.height - BORDER;
+
+		switch (position)
+		{
+			case TOP_CENTER: return new Point(centre, bounds.y + BORDER);
+			case TOP_RIGHT: return new Point(right, top);
+			case BOTTOM_LEFT: return new Point(left, bottom);
+			case BOTTOM_CENTER: return new Point(centre, bottom);
+			case BOTTOM_RIGHT: return new Point(right, bottom);
+			case ABOVE_CHATBOX_RIGHT: return new Point(right, bottom - CHATBOX_HEIGHT);
+			case TOP_LEFT:
+			default: return new Point(left, top);
+		}
+	}
+
+	/**
+	 * The top-left corner an overlay of {@code size} actually draws at, given its corner's running
+	 * {@code cursor}. Pure, so the placement arithmetic can be asserted without a game.
+	 */
+	static Point placeAt(OverlayPosition position, Point cursor, Dimension size)
+	{
+		final Point offset = transformPosition(position, size);
+		return new Point(cursor.x + offset.x, cursor.y + offset.y);
+	}
+
+	/** Moves {@code cursor} past an overlay {@code height} tall, away from the edge it is pinned to. */
+	static void advance(OverlayPosition position, Point cursor, int height)
+	{
+		cursor.y += growsUpward(position) ? -(height + PADDING) : height + PADDING;
+	}
+
+	/**
+	 * How far an overlay of {@code size} must be shifted off its anchor so the anchored EDGE of the
+	 * overlay meets the anchor: right-anchored overlays move left by their width, bottom-anchored
+	 * ones up by their height, centred ones left by half their width. This is what replaces the old
+	 * hardcoded "assume every panel is 160 wide and 200 tall".
+	 */
+	static Point transformPosition(OverlayPosition position, Dimension size)
+	{
+		final Point offset = new Point();
+		switch (position)
+		{
+			case TOP_LEFT:
+				break;
+			case TOP_CENTER:
+				offset.x -= size.width / 2;
+				break;
+			case TOP_RIGHT:
+				offset.x -= size.width;
+				break;
+			case BOTTOM_LEFT:
+				offset.y -= size.height;
+				break;
+			case BOTTOM_CENTER:
+				offset.x -= size.width / 2;
+				offset.y -= size.height;
+				break;
+			case BOTTOM_RIGHT:
+			case ABOVE_CHATBOX_RIGHT:
+				offset.x -= size.width;
+				offset.y -= size.height;
+				break;
+			default:
+				break;
+		}
+		return offset;
 	}
 
 	private static int layerRank(Overlay o)

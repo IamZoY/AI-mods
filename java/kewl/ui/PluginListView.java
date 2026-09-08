@@ -41,13 +41,53 @@ final class PluginListView {
         }
         y += 6;
 
+        // Alphabetical, but developer scaffolding (kewl.Plugin.developer(): the shim smoke tests and
+        // the two kewl box drawers the RuneLite ports replaced) sorts below everything and draws
+        // under its own heading. Same grouping the ImGui panel does, so the two panels still agree
+        // about what the list looks like.
         List<Plugin> sorted = new ArrayList<>(plugins);
-        sorted.sort(Comparator.comparing(p -> p.name().toLowerCase()));
+        sorted.sort(Comparator.comparing((Plugin p) -> p.developer())
+                .thenComparing((Plugin p) -> p.name().toLowerCase()));
 
+        boolean headingDrawn = false;
         for (Plugin p : sorted) {
+            if (p.developer() && !headingDrawn) {
+                headingDrawn = true;
+                y = developerHeader(ctx, y);
+            }
+            if (p.developer() && !developerOpen) continue;
             y = row(ctx, p, y);
         }
         return y + SidePanel.PAD;
+    }
+
+    // Collapsed by default, like the launcher's Developer header: the point of the grouping is a
+    // list of the plugins someone actually runs. One static flag -- there is one panel, drawn on one
+    // thread, and the state is a UI preference that is fine to forget between sessions.
+    private static boolean developerOpen;
+
+    /** The "Developer" divider: chevron, dim bold name, 1px line -- ConfigView.sectionHeader's shape. */
+    private static int developerHeader(PanelCtx ctx, int y) {
+        Graphics2D g = ctx.g;
+        int x = ctx.left;
+        int w = ctx.right - x;
+        y += 4;
+        if (!ctx.visible(y, 18)) {
+            ctx.hit(x, y, w, 18, () -> developerOpen = !developerOpen);
+            return y + 18 + GAP;
+        }
+        boolean hover = ctx.hover(x, y, w, 18);
+
+        Widgets.chevron(g, x, y + 5, !developerOpen, hover ? Theme.RL_LABEL : Theme.TEXT_DIM);
+        g.setFont(Theme.UI_BOLD);
+        g.setColor(hover ? Theme.RL_LABEL : Theme.TEXT_DIM);
+        g.drawString("Developer", x + 14, y + 12);
+        g.setColor(Theme.RL_DIVIDER);
+        g.drawLine(x, y + 17, x + w, y + 17);
+
+        ctx.hit(x, y, w, 18, () -> developerOpen = !developerOpen);
+        if (hover) ctx.tooltip("smoke tests and worked examples, kept for development");
+        return y + 18 + GAP;
     }
 
     private static int row(PanelCtx ctx, Plugin p, int y) {

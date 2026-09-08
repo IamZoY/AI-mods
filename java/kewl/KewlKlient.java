@@ -46,15 +46,37 @@ public final class KewlKlient {
      * <p><b>Add yours here.</b> One line.</p>
      */
     private static final List<Plugin> PLUGINS = new ArrayList<>(List.of(
-            new kewl.plugins.PlayerVisuals(),
-            new kewl.plugins.NpcVisuals(),
+            // The two kewl box drawers were the worked examples that proved the overlay; the RuneLite
+            // ports below (NPC Indicators / Player Indicators) are the real visuals now, so these are
+            // marked developer -- still here, still switchable, just under the panel's Developer
+            // heading instead of at the top of the list. markDeveloper() rather than an override so
+            // the plugin classes stay untouched (kewl.Plugin.developer()).
+            new kewl.plugins.PlayerVisuals().markDeveloper(),
+            new kewl.plugins.NpcVisuals().markDeveloper(),
             new kewl.plugins.Woodcutter(),
             new kewl.rl.RlitePlugin("Shortest Path", "Pathfinder over the world map, with auto-walk",
                     shortestpath.ShortestPathPlugin::new),
+            // RuneLite ports over the shim's actor surface (net.runelite.client.plugins.*). Opt-in
+            // until seen live -- kewl's own NpcVisuals/PlayerVisuals stay the default-on box drawers.
+            new kewl.rl.RlitePlugin("NPC Indicators", "Highlight NPCs by name or id: hull box, tile, true tile, name",
+                    net.runelite.client.plugins.npchighlight.NpcIndicatorsPlugin::new),
+            new kewl.rl.RlitePlugin("Player Indicators", "Names over players, coloured by own/others",
+                    net.runelite.client.plugins.playerindicators.PlayerIndicatorsPlugin::new),
             // Kept until Shortest Path has been seen working in-game: if it misbehaves, this
             // minimal shim smoke test isolates whether the fault is the port or the shim.
             new kewl.rl.RlitePlugin("Test Rlite", "Shim smoke test: config, events, overlay",
-                    kewl.rl.TestRlite::new)
+                    kewl.rl.TestRlite::new).markDeveloper(),
+            // Appended at the END: panel edit indices are positional (docs/plugin-system.md).
+            new kewl.rl.RlitePlugin("Test Actors",
+                    "Shim smoke test: NPC/player actors, hull, name text, spawn events",
+                    kewl.rl.TestActors::new).markDeveloper(),
+            // Autologin: types ~/.kewlklient/autologin.properties into the title screen. Off by
+            // default and NOT in defaultOn() -- a plugin that types a password is switched on by the
+            // user once; the profile remembers the switch. Appended LAST: bridge indices are positional.
+            new kewl.plugins.AutoLogin(),
+            // Anti-idle: a camera-key tap every few minutes so the server does not log the account
+            // out (seen live 2026-09-06). Off by default; appended after AutoLogin (positional indices).
+            new kewl.plugins.AntiIdle()
     ));
 
     // The overlay image, reused between frames. Reallocating eight megabytes thirty times a second
@@ -135,7 +157,10 @@ public final class KewlKlient {
      * is on when I start" is one list rather than a hunt through every plugin.
      */
     private static boolean defaultOn(Plugin p) {
-        return p instanceof kewl.plugins.PlayerVisuals || p instanceof kewl.plugins.NpcVisuals;
+        // The RuneLite-style indicators are the default visuals since 2026-09-06 (hull, name and
+        // tile at each entity's real height); kewl's own NpcVisuals/PlayerVisuals stay in the list
+        // as the README's worked examples, off unless switched on.
+        return p.name().equals("NPC Indicators") || p.name().equals("Player Indicators");
     }
 
     /**

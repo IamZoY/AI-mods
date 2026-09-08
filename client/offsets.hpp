@@ -39,6 +39,14 @@ namespace kk::off {
 // items marked NOT (re-)VERIFIED were read out of the binary but not confirmed against a running game.
 inline constexpr std::uintptr_t BUILD_ID = 0xF6140;
 
+// The same build, as the client itself states it: osclient.exe's PE version resource carries the
+// release as FileVersion "240-6" (client-240-6 in the CDN metafile, above). BUILD_ID is an RVA and
+// cannot be checked without already trusting these offsets; this string CAN be checked before a
+// single game byte is read, and dllmain.cpp does exactly that -- a mismatch refuses to start rather
+// than reading garbage out of a stranger's address space. Bump it in the same commit as everything
+// else in this file, never on its own.
+inline constexpr const wchar_t* BUILD_VERSION = L"240-6";
+
 // ---------------------------------------------------------------------------------------------------
 // THE ROOT POINTER
 // ---------------------------------------------------------------------------------------------------
@@ -84,7 +92,11 @@ inline constexpr std::uintptr_t DO_ACTION = 0;
 // HOW FOUND (client-240-6): the Graphics usertype's worldToScreenCoord method. Its closure body is
 // this function, and its shape -- same argument order, same out-array write -- matches the leaf the
 // previous build used, just with the projection maths now split between two callees it invokes
-// internally. NOT VERIFIED in-game: draw a tile outline and see whether it sits on the tile.
+// internally. OUTPUT SPACE VERIFIED LIVE 2026-09-05 (Windows, logged in): the leaf's final rescale
+// read identity (both VIEW_* pairs below == the JagRenderView client size, 1606x900 and 1356x900),
+// so what it writes is consistent with canvas pixels in that window's space. POINT ACCURACY NOT
+// VERIFIED: the probe projected the tile's south-west corner at height 0 (see jvm.hpp nProject),
+// which cannot be judged against the character; the centre probe is the pending test.
 inline constexpr std::uintptr_t WORLD_TO_SCREEN = 0x2202A0;
 
 // The projection's camera position and canvas-scale pair, read by the leaf above and by its last
@@ -92,23 +104,32 @@ inline constexpr std::uintptr_t WORLD_TO_SCREEN = 0x2202A0;
 // client+0x895d8 / +0x895dc / +0x895e0 from the fine input before projecting -- the camera position
 // in the same fine axis order we pass ({x, height, y}; the axis order is pinned by FUN_1406a8130,
 // where the second coordinate only ever reaches the depth and vertical terms). Its final step
-// FUN_140618ce0 then rescales the result by (*(client+0x90)+0x10+0x5c) / (+0x20) for x and
-// (*(client+0x90)+0x10+0x60) / (+0x24) for y -- a divide/multiply pair nobody has identified, which
-// is why WORLD_TO_SCREEN above is still marked NOT VERIFIED. These exist here only so nProject's
-// once-a-second probe (jvm.hpp; off unless KEWL_LOG is set) can print them next to a projected point:
-// standing still, the probe's own tile must land on your character, and the printed view=(n/d, n/d)
-// ratios say whether the leaf returns a scaled space instead of canvas pixels. NOT VERIFIED in-game --
-// that probe is the test.
+// FUN_140618ce0 then rescales the result: x *= (+0x5C)/(+0x20), y *= (+0x60)/(+0x24), all four ints
+// hanging off *(client+0x90)+0x10. These exist here only so nProject's probe (jvm.hpp; off unless
+// KEWL_LOG is set) can print them next to a projected point.
+//
+// VERIFIED LIVE 2026-09-05 (Windows, logged in, three samples): +0x20/+0x24 read (1606,900) then
+// (1356,900), and +0x5C/+0x60 read exactly the same -- i.e. the four ints are TWO (width,height)
+// pairs, both equal to the JagRenderView child window's client size printed as canvas= in the same
+// line, and the rescale is identity (1606/1606, 900/900). So the leaf returns canvas pixels in that
+// window's space and NO ratio correction belongs in projectFine. The old names (BASE_W=0x5C,
+// BASE_H=0x20, ...) split each pair across two names and led the probe to print +0x60/+0x5C, a
+// height over a width, which read as a bogus 0.56 scale factor; the names below follow the roles the
+// decompile note gives them (IN = divisor pair at +0x20/+0x24, OUT = multiplier pair at +0x5C/+0x60).
+// Which pair is numerator vs denominator rests on the decompile note only -- moot while both are 1.
+// The camera ints are scene-fine (they sat within a tile of the player's sceneX<<7 / sceneY<<7) and
+// CAMERA_FINE_H read -852/-801/-849, i.e. the same negative-up height axis the leaf's second input
+// uses; the height the terrain sits at in that axis is NOT KNOWN (no heightmap offset is derived).
 inline constexpr std::uintptr_t CAMERA_FINE_X = 0x895D8;
 inline constexpr std::uintptr_t CAMERA_FINE_H = 0x895DC;
 inline constexpr std::uintptr_t CAMERA_FINE_Y = 0x895E0;
 inline constexpr std::uintptr_t VIEW_OBJ            = 0x90;  // -> view object
 inline constexpr std::uintptr_t VIEW_OBJ_SCALE_BASE = 0x10;  // the scales hang off view+0x10, so a
                                                              // scale address is this base + the VIEW_*
-inline constexpr std::uintptr_t VIEW_BASE_W   = 0x5C;    // x rescale numerator
-inline constexpr std::uintptr_t VIEW_BASE_H   = 0x20;    // x rescale denominator
-inline constexpr std::uintptr_t VIEW_CANVAS_W = 0x60;    // y rescale numerator
-inline constexpr std::uintptr_t VIEW_CANVAS_H = 0x24;    // y rescale denominator
+inline constexpr std::uintptr_t VIEW_IN_W  = 0x20;   // x rescale denominator (a WIDTH: 1606 live)
+inline constexpr std::uintptr_t VIEW_IN_H  = 0x24;   // y rescale denominator (a HEIGHT: 900 live)
+inline constexpr std::uintptr_t VIEW_OUT_W = 0x5C;   // x rescale numerator   (a WIDTH: 1606 live)
+inline constexpr std::uintptr_t VIEW_OUT_H = 0x60;   // y rescale numerator   (a HEIGHT: 900 live)
 
 // ---------------------------------------------------------------------------------------------------
 // FIELDS ON THE CLIENT OBJECT
@@ -368,7 +389,7 @@ inline constexpr std::uintptr_t SCENE_NPC_UID_COUNT = 0xD8;  // field on the sce
 // ---------------------------------------------------------------------------------------------------
 // FIELDS ON THE SCENE OBJECT  ( *(clientObj + SCENE) )
 // ---------------------------------------------------------------------------------------------------
-// The scene's south-west corner in WORLD tiles. Entities carry SCENE coordinates (0..104), so:
+// The scene's south-west corner in WORLD tiles. Entities carry SCENE coordinates (0..103), so:
 //     worldX = SCENE_BASE_X + entity.sceneX
 //
 // HOW FOUND (client-240-6): the previous build kept these at scene+0x48/0x4C; on this build those
@@ -385,6 +406,21 @@ inline constexpr std::uintptr_t SCENE_BASE_Y = 0x28;
 inline constexpr std::uintptr_t ENTITY_SCENE_X = 0x3F0;
 inline constexpr std::uintptr_t ENTITY_SCENE_Y = 0x418;
 
+// The entity's RENDER position: fine units (128 per tile), three consecutive ints {height, x, y}.
+// HOW FOUND (client-240-6, live on Windows, logged in, 2026-09-05): the KEWL_LOG [proj] probe scanned
+// the local player's struct for ints within a tile of the trusted (ENTITY_SCENE_X<<7)+64 and
+// (ENTITY_SCENE_Y<<7)+64, and for plausible heights (-1500..-50). The only contiguous triple was
+//   +0x1F8 = -312   +0x1FC = 6336   +0x200 = 6720      at scene (49,52) -- x/y exactly the tile centre.
+// (Copies: x/y again at +0x268/+0x26C, the height again at +0x788.) The HEIGHT is the prize: the
+// terrain heightmap is still unread, but every entity carries its own ground height here, and -312 is
+// where the character's feet were on the screenshot while the datum-0 projection sat ~290 canvas px
+// too low. VERIFIED LIVE at one spot on plane 0 only; NOT VERIFIED on slopes, stairs or while moving
+// (while walking the x/y here should interpolate between tiles -- if they stay at the centre they are
+// a tile-derived copy, which is still right for drawing).
+inline constexpr std::uintptr_t ENTITY_FINE_H = 0x1F8;
+inline constexpr std::uintptr_t ENTITY_FINE_X = 0x1FC;
+inline constexpr std::uintptr_t ENTITY_FINE_Y = 0x200;
+
 // Which floor an entity is standing on (0..3). NOT RE-DERIVED, and this build's decompile CONTRADICTS
 // the value. Provenance: added 2026-08-10 (commit e03f6e7) on the previous build with no note, never
 // re-checked. On client-240-6 the entity's own `coord` Lua binding (leaf FUN_1403af050, registered as
@@ -398,6 +434,13 @@ inline constexpr std::uintptr_t ENTITY_SCENE_Y = 0x418;
 // Candidate replacement: 0x7CC -- verify live (climb a staircase/ladder and watch the field step
 // 0..3) before switching; do not flip it on this note alone.
 inline constexpr std::uintptr_t ENTITY_PLANE   = 0x420;  // SUSPECT: this build points at 0x7CC instead
+// The decompile's candidate, as a SEPARATE constant so 0x420 is not flipped on the note alone: the
+// `coord` binding (FUN_1403af050) and FUN_1400a06e0 above both read entity+0x7CC as the level.
+// Decompile-backed, NOT VERIFIED in-game (2026-09-05). game.hpp reads BOTH: 0x7CC when it is in
+// 0..3, else 0x420 when that is, else -1 -- so if 0x7CC is wrong nothing gets worse than before,
+// and the KEWL_LOG [proj] line prints raw420/raw7CC side by side for the staircase check. Once one
+// of them is seen stepping 0..3 on stairs, collapse to a single read and retire the other.
+inline constexpr std::uintptr_t ENTITY_PLANE_COORD = 0x7CC;
 // The reader in game.hpp range-guards the result (0..3, else -1 = unknown) so at least obvious
 // garbage is not shipped as a plane; an in-range but wrong value cannot be caught from the number
 // alone, which is why the live staircase check above still has to happen before this is trusted.
@@ -464,6 +507,11 @@ inline constexpr std::uintptr_t IFACE_GROUP_ENTRY_COUNT  = 0x8;  // in the entry
 inline constexpr std::uintptr_t IFACE_GROUP_ENTRY_DATA   = 0x10; // in the entry: -> componentData
 inline constexpr std::uintptr_t IFACE_EMPTY_SENTINEL = 0x155C5F0;  // global; compare entry+8's
                                                                   // pointee against *(base+this+8)
+// A 2026-09-06 probe claimed these were wrong -- every component measuring 1x1 -- and that claim was
+// RETRACTED the same day: the probe's own walk read the 16-byte shared_ptr entry at +0 (the control
+// block) instead of +8 (the object), which widgetObj() has always done correctly. The rectangle block
+// below is not implicated; what a widget's x/y MEAN is still the open question (see the parent-offset
+// note in the Remaining limitations section of PROGRESS.md).
 inline constexpr std::uintptr_t IFTYPE_X            = 0x5C;   // int, relative to the parent
 inline constexpr std::uintptr_t IFTYPE_Y            = 0x60;
 inline constexpr std::uintptr_t IFTYPE_WIDTH        = 0x64;
@@ -476,6 +524,70 @@ inline constexpr std::uintptr_t IFTYPE_TEXT_FLAG    = 0x16F;  //   bit7 = heap, 
 inline constexpr std::uintptr_t IFTYPE_TEXT2        = 0x170;
 inline constexpr std::uintptr_t IFTYPE_TEXT2_FLAG   = 0x187;
 
+// ---------------------------------------------------------------------------------------------------
+// THE PARENT LINK -- DERIVED AT RUNTIME ON PURPOSE, NOT A NUMBER HERE
+// ---------------------------------------------------------------------------------------------------
+// A component's IFTYPE_X/IFTYPE_Y are relative to its PARENT, so every absolute (canvas) rectangle in
+// the shim is the sum of the component's own x/y and each ancestor's. RuneLite's getCanvasLocation is
+// literally that sum, and the client stores the link the sum needs: the if3 cache format decodes a
+// 16-bit parent component index and the client widens it to (group << 16) | parentComp, with 0xFFFF
+// meaning -1. Everything else the sum needs is already readable here.
+//
+// WHY THERE IS NO `IFTYPE_PARENT_ID = 0x...` LINE BELOW. Nobody has run a decompiler at this field on
+// client-240-6, and this project's rule is that a number in this file is EVIDENCE, not a hypothesis.
+// So game.hpp derives the offset live instead, with a whole-tree tally that only accepts an answer
+// which holds for EVERY component of EVERY loaded group (kk::scanWidgetTree). The acceptance rules,
+// written down here because they are the derivation:
+//
+//   idOff         v == ((group << 16) | componentIndex) on every component examined. This field is not
+//                 needed for the sum -- it is the POSITIVE CONTROL. The tally is only believable if it
+//                 can find a field whose value we already know, using the same rule that finds the
+//                 unknown one.
+//   parentIdOff   every component reads either -1 (a root) or a value whose high 16 bits are its own
+//                 group and whose low 16 bits index inside that group's component array -- and at
+//                 least one component reads the latter. Nothing else is allowed at that offset, in any
+//                 group. Then the tree it implies is walked from every component: it must be an
+//                 acyclic forest that terminates within IFTYPE_CHAIN_MAX steps, which throws out an
+//                 unrelated index field that merely happens to look like a packed id.
+//   parentPtrOff  the same idea for a C++-shaped link: an 8-byte slot holding either null or a pointer
+//                 to ANOTHER component object of the same group. This build is NXT (C++), not the Java
+//                 client, so the transliterated IfType may well carry a raw parent pointer where the
+//                 Java class carries an int -- the tally looks for both and says which it found.
+//
+// AMBIGUITY IS A REFUSAL, NOT A COIN FLIP. If two offsets survive all of that, none is used: widgetAbs
+// reports complete = 0, Java keeps refusing exactly as it did before, and the probe's report names
+// every survivor so a human can pin the right one HERE with the counts as the evidence. Shipping the
+// lower offset because it was lower would be a guess wearing a derivation's clothes.
+//
+// WHAT THIS BLOCK DOES NOT CLAIM, and both matter to whoever reads a wrong rectangle later:
+//
+//   (i)  SCROLL. RuneLite subtracts each ANCESTOR's scrollX/scrollY while summing. No scroll offset is
+//        derived on this build (java Widget.setScrollY stores a number the client never sees), so the
+//        sum omits that term. Neither map is affected -- no ancestor of the minimap draw area or of
+//        the world-map container scrolls -- but a row inside a scrolled list (quest list, chatbox
+//        scrollback) comes out off by the scroll amount. Find them by diffing: read a scrollable
+//        container's struct, scroll it a known amount, read again, take the int that moved by exactly
+//        that much -- the same "look for a value you already know" method that found the rect block.
+//   (ii) CROSS-GROUP PARENTING. parentId is same-group BY THE DECODE RULE, so a group opened onto
+//        another group's component (world map 595, bank, any modal) has a root this chain cannot climb
+//        past. RuneLite resolves that through the client's component table (a WidgetNode whose hash is
+//        the parent component id and whose value is the group id); that table's offset is undiscovered
+//        here. The pragmatic reading is that such groups open onto a canvas-sized MAINMODAL at (0,0),
+//        which would make the missing term zero -- UNCONFIRMED, and deliberately not assumed: the
+//        chain simply terminates at the group root, `complete` still reports 1 for that walk, and the
+//        one-shot log line prints 595:7's chain so the reading can be taken rather than guessed.
+//
+// THE FORK THIS RESTS ON. All of the above assumes IFTYPE_X/Y are the POST-LAYOUT rect (the Java
+// client's relativeX/relativeY), not the cache originals -- i.e. that the client has ALREADY applied
+// the position/size modes and left the result here. The evidence is in this file: the top-level groups
+// read canvas-sized 1054x784 live, and a canvas-sized width is a laid-out value, never a cache
+// constant. The runtime self-test in kk::widgetChainString states the same thing as a measurement
+// instead of an argument: a group ROOT must come out abs (0,0) at exactly the canvas size. If it does
+// not, these are cache originals, and the position/size MODE bytes and originalX/originalY have to be
+// derived and the client's alignment re-implemented -- a much bigger job than this one.
+inline constexpr std::uintptr_t IFTYPE_SCAN_SPAN = 0x400;  // struct prefix the tally reads per component
+inline constexpr int            IFTYPE_CHAIN_MAX = 16;     // depth cap on any parent walk
+
 // Both VERIFIED LIVE on client-240-6: every enumerated GE NPC read -1 at 0x4D8 while standing still
 // and a cardinal 0/512/1024/1536 at 0x3E0; coords at 0x3F0/0x418 match npcCoord's disasm exactly.
 inline constexpr std::uintptr_t ENTITY_ANIMATION   = 0x4D8;  // current animation id, -1 when idle
@@ -486,6 +598,42 @@ inline constexpr std::uintptr_t ENTITY_ORIENTATION = 0x3E0;  // 0..2047, 0 = sou
 // local player it read -1, so this offset is simply WRONG on client-240-6. NOT VERIFIED -- re-derive
 // from the client's combat-level Lua binding before trusting any number that comes out of here.
 inline constexpr std::uintptr_t PLAYER_COMBAT_LEVEL = 0x734;
+
+// ---------------------------------------------------------------------------------------------------
+// THE LOGIN FORM'S FIELDS -- NOT VERIFIED
+// ---------------------------------------------------------------------------------------------------
+// Distance from the client's username buffer to its password buffer, so the autologin plugin can SET
+// the two fields instead of typing them at a form whose focus it cannot see.
+//
+// HOW IT WAS FOUND, and it is worth knowing how little that is: nFindString was run live on
+// 2026-09-06 for the username the client was already rendering in the Login field. FOUR addresses
+// held it. Running the same search for the password paired two of them:
+//
+//   * one pair 508 bytes apart with BINARY PADDING between the two hits -- the shape of a struct with
+//     fixed-size buffers, which is what a login form is. This is the number below.
+//   * one pair a short distance apart with PRINTABLE TEXT between them, the text being
+//     `","password":"`. That is our OWN profile config.json sitting in the JVM heap, not the client.
+//     FieldWriter discards any pair whose gap is printable for exactly this reason -- writing there
+//     would corrupt the JVM's heap, not the game.
+//
+// NOT VERIFIED: nothing has yet confirmed that writing at this delta changes what the form displays.
+// The feature is opt-in ("Set the fields directly (experimental)", default OFF) and every write goes
+// through nSetLoginField in jvm.hpp, which refuses unless the target is committed, writable, and
+// already holds either all zeroes or exactly the value being written. Until a live run shows the form
+// filling in by itself, treat this as a hypothesis. (It was one, and it was wrong -- see REFUTED below.)
+//
+// MIRRORED IN JAVA: kewl.plugins.autologin.FieldWriter.PASSWORD_DELTA. Nothing checks that the two
+// agree -- there is no seam between a C++ constant and a Java one -- so move them together by hand.
+// REFUTED, 2026-09-06, by the probe run that followed: 508 was measured while the pair-gap classifier
+// read the wrong window (it started inside the password's own bytes whenever the password was longer
+// than the username), so it called our profile config.json's `","password":"` gap "binary padding" and
+// promoted a JVM-heap document to a struct. With that bug fixed, BOTH pairs classify as TEXT and no
+// candidate survives at all: the client's own login buffers were never among the hits. So this number
+// is a measurement of our own JSON file, not of the game, and FieldWriter refuses every candidate --
+// which is the designed outcome, not a failure. Left here, with its history, because the next attempt
+// should start by knowing this one was wrong; the direct-write setting stays off until a probe finds a
+// pair whose gap is really binary and whose write really changes the form.
+inline constexpr std::int32_t LOGIN_PASSWORD_DELTA = 508;
 
 // ---------------------------------------------------------------------------------------------------
 // MENU OPCODES
